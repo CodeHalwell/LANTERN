@@ -48,7 +48,7 @@ class SparseAttention(nn.Module):
         """
         super().__init__()
         
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        assert hidden_size % num_heads == 0, f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
         
         head_dim = hidden_size // num_heads
         if use_rope:

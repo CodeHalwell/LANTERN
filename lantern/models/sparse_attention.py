@@ -107,18 +107,13 @@ class SparseAttention(nn.Module):
         
         Returns a boolean mask where True indicates positions to attend to.
         """
-        # Start with causal mask (lower triangular)
-        mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-        
-        # Apply window constraint: only attend to tokens within window
-        for i in range(seq_len):
-            start = max(0, i - self.window_size + 1)
-            # Zero out positions before the window (but after position 0)
-            if start > 0:
-                # Keep global tokens accessible
-                for j in range(start):
-                    if j not in self.global_token_indices:
-                        mask[i, j] = False
+        # Create window mask using broadcasting
+        row_indices = torch.arange(seq_len, device=device).unsqueeze(1)
+        col_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+        mask = (row_indices >= col_indices) & (row_indices - col_indices < self.window_size)
+        # Add global token mask
+        for idx in self.global_token_indices:
+            mask[:, idx] = True
         
         return mask
     

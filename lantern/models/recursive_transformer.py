@@ -191,6 +191,8 @@ class RecursiveTransformerBlock(nn.Module):
             # Check for adaptive halting
             if use_adaptive_halting and p_halt is not None:
                 cum_halt = cum_halt + p_halt
+                # Clamp cumulative halting to prevent values > 1.0 (proper ACT)
+                cum_halt = torch.clamp(cum_halt, max=1.0)
                 done = (cum_halt >= 1 - halting_eps).all()
                 if done:
                     break

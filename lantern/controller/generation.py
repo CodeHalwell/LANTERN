@@ -331,12 +331,18 @@ def create_generation_controller(
     Returns:
         Configured GenerationController.
     """
+    # Filter kwargs for GenerationConfig using dataclass fields
+    generation_config_fields = set(GenerationConfig.__dataclass_fields__.keys())
     config = GenerationConfig(**{k: v for k, v in kwargs.items() 
-                                  if hasattr(GenerationConfig, k)})
+                                  if k in generation_config_fields})
     
+    # Filter kwargs for UncertaintyController using inspect
+    import inspect
+    uncertainty_params = set(inspect.signature(UncertaintyController.__init__).parameters.keys())
+    uncertainty_params.discard('self')
     uncertainty_controller = UncertaintyController(
         **{k: v for k, v in kwargs.items() 
-           if hasattr(UncertaintyController.__init__, k)}
+           if k in uncertainty_params}
     )
     
     return GenerationController(

@@ -50,6 +50,10 @@ class SparseAttention(nn.Module):
         
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
         
+        head_dim = hidden_size // num_heads
+        if use_rope:
+            assert head_dim % 2 == 0, "head_dim must be even when using RoPE"
+        
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads

@@ -22,7 +22,6 @@ from lantern.uncertainty.semantic_dispersion import (
 from lantern.uncertainty.bayesian import (
     dropout_enabled,
     BayesianSampler,
-    bayesian_step,
     compute_predictive_entropy,
 )
 

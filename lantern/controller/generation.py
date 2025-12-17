@@ -16,10 +16,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lantern.uncertainty.bayesian import bayesian_step, dropout_enabled
+from lantern.uncertainty.bayesian import bayesian_step
 from lantern.controller.uncertainty_controller import (
     UncertaintyController,
-    UncertaintyLevel,
     UncertaintyResult,
 )
 
@@ -159,8 +158,7 @@ class GenerationController:
         
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > self.config.top_p
-        # Keep first token regardless
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        # Always keep the first token
         sorted_indices_to_remove[..., 0] = False
         
         sorted_probs[sorted_indices_to_remove] = 0
@@ -278,6 +276,12 @@ class GenerationController:
         """
         Generate a sequence of tokens.
         
+        Note: This method demonstrates the generation control flow logic
+        (uncertainty-aware sampling, THINK token injection, mode switching)
+        but is incomplete for actual text generation. A full implementation
+        requires integration with an embedding layer to update hidden states
+        between generation steps.
+        
         Args:
             input_hidden_states: Initial context hidden states.
             max_tokens: Maximum tokens to generate (overrides config).
@@ -302,10 +306,13 @@ class GenerationController:
             if step.token_id == self.config.eos_token_id:
                 break
             
-            # Update hidden states for next iteration
-            # In a real implementation, this would involve embedding the token
-            # and concatenating to the sequence. Here we just track the logic.
-            # hidden_states = self._update_hidden_states(hidden_states, next_token)
+            # Note: In a full implementation with an embedding layer, you would:
+            # 1. Embed the generated token
+            # 2. Concatenate to the sequence
+            # 3. Re-run through the model
+            # This is a placeholder - the generate() method demonstrates the control
+            # flow logic but requires integration with a full model pipeline for
+            # actual token generation with proper hidden state updates.
         
         # Reset to normal mode after generation
         self._switch_to_normal_mode()
@@ -332,12 +339,14 @@ def create_generation_controller(
         Configured GenerationController.
     """
     # Filter kwargs for GenerationConfig using dataclass fields
-    generation_config_fields = set(GenerationConfig.__dataclass_fields__.keys())
+    from dataclasses import fields
+    import inspect
+    
+    generation_config_fields = {f.name for f in fields(GenerationConfig)}
     config = GenerationConfig(**{k: v for k, v in kwargs.items() 
                                   if k in generation_config_fields})
     
     # Filter kwargs for UncertaintyController using inspect
-    import inspect
     uncertainty_params = set(inspect.signature(UncertaintyController.__init__).parameters.keys())
     uncertainty_params.discard('self')
     uncertainty_controller = UncertaintyController(

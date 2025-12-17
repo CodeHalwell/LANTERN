@@ -121,6 +121,5 @@ def normalize_entropy(
     Returns:
         Normalized entropy in [0, 1].
     """
-    import math
-    max_entropy = math.log(vocab_size)
+    max_entropy = torch.log(torch.tensor(vocab_size, dtype=entropy.dtype, device=entropy.device))
     return entropy / max_entropy

@@ -91,9 +91,9 @@ class SparseAttention(nn.Module):
         cos = self.cos_cached[:seq_len].unsqueeze(0).unsqueeze(0)
         sin = self.sin_cached[:seq_len].unsqueeze(0).unsqueeze(0)
         
-        # Rotate half the dimensions
-        x1, x2 = x[..., :self.head_dim // 2], x[..., self.head_dim // 2:]
-        rotated = torch.cat([-x2, x1], dim=-1)
+        # Rotate pairs of dimensions (interleaved)
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
         
         return x * cos + rotated * sin
     

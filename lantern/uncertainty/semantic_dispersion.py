@@ -9,6 +9,22 @@ import torch
 import torch.nn.functional as F
 
 
+def _ensure_batched(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """
+    Ensure tensor is batched (2D).
+    
+    Args:
+        tensor: Input tensor, either [vocab_size] or [batch, vocab_size].
+        
+    Returns:
+        Tuple of (batched tensor, was_originally_batched).
+    """
+    is_batched = tensor.dim() == 2
+    if not is_batched:
+        tensor = tensor.unsqueeze(0)
+    return tensor, is_batched
+
+
 def compute_semantic_dispersion(
     logits: torch.Tensor,
     embedding_matrix: torch.Tensor,
@@ -31,11 +47,7 @@ def compute_semantic_dispersion(
         Weighted variance (dispersion) of top-k embeddings.
     """
     # Handle both batched and unbatched inputs
-    is_batched = logits.dim() == 2
-    if not is_batched:
-        logits = logits.unsqueeze(0)
-    
-    batch_size = logits.shape[0]
+    logits, is_batched = _ensure_batched(logits)
     
     # Get probabilities and top-k
     probs = F.softmax(logits / temperature, dim=-1)
@@ -115,9 +127,7 @@ def compute_pairwise_similarity(
     Returns:
         Average pairwise cosine similarity.
     """
-    is_batched = logits.dim() == 2
-    if not is_batched:
-        logits = logits.unsqueeze(0)
+    logits, is_batched = _ensure_batched(logits)
     
     # Get top-k indices
     _, topk_idx = F.softmax(logits / temperature, dim=-1).topk(k, dim=-1)

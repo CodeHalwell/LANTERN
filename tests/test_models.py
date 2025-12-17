@@ -4,7 +4,6 @@ Tests for LANTERN sparse attention and recursive transformer.
 
 import pytest
 import torch
-import torch.nn as nn
 
 from lantern.models.sparse_attention import SparseAttention
 from lantern.models.recursive_transformer import (

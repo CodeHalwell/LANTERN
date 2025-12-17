@@ -7,10 +7,9 @@ epistemic variance) into a composite score for decision making.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from lantern.uncertainty.entropy import compute_entropy, compute_p_max
 from lantern.uncertainty.semantic_dispersion import compute_semantic_dispersion

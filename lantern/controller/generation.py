@@ -8,7 +8,8 @@ Implements the full decoding loop with:
 - Bayesian refinement
 """
 
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
@@ -158,7 +159,7 @@ class GenerationController:
         
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > self.config.top_p
-        # Always keep the first token
+        # Always keep the highest probability token (first after sorting)
         sorted_indices_to_remove[..., 0] = False
         
         sorted_probs[sorted_indices_to_remove] = 0
@@ -339,9 +340,6 @@ def create_generation_controller(
         Configured GenerationController.
     """
     # Filter kwargs for GenerationConfig using dataclass fields
-    from dataclasses import fields
-    import inspect
-    
     generation_config_fields = {f.name for f in fields(GenerationConfig)}
     config = GenerationConfig(**{k: v for k, v in kwargs.items() 
                                   if k in generation_config_fields})

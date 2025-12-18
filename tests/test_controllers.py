@@ -90,6 +90,21 @@ class TestUncertaintyController:
         
         assert level == UncertaintyLevel.VERY_HIGH
     
+    def test_classify_uncertainty_batched(self):
+        """Test classification with batched scores."""
+        controller = UncertaintyController(tau_low=1.0, tau_mid=2.0, tau_high=3.0)
+        
+        # Batched scores with different levels
+        scores = torch.tensor([0.5, 1.5, 2.5, 4.0])
+        levels = controller.classify_uncertainty(scores)
+        
+        assert isinstance(levels, list)
+        assert len(levels) == 4
+        assert levels[0] == UncertaintyLevel.CONFIDENT
+        assert levels[1] == UncertaintyLevel.MODERATE
+        assert levels[2] == UncertaintyLevel.HIGH
+        assert levels[3] == UncertaintyLevel.VERY_HIGH
+    
     def test_compute_total_uncertainty(self):
         """Test combining base and epistemic uncertainty."""
         controller = UncertaintyController(epistemic_weight=0.5)
@@ -132,6 +147,30 @@ class TestUncertaintyController:
         )
         assert controller.should_trigger_reasoning(high_result)
     
+    def test_should_trigger_reasoning_batched(self):
+        """Test reasoning trigger logic with batched scores."""
+        controller = UncertaintyController(tau_high=3.0)
+        
+        # All below threshold - no trigger
+        low_result = UncertaintyResult(
+            entropy=torch.tensor([0.5, 1.0]),
+            p_max=torch.tensor([0.8, 0.7]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([1.0, 2.0]),
+            total_score=torch.tensor([1.0, 2.0]),
+        )
+        assert not controller.should_trigger_reasoning(low_result)
+        
+        # At least one above threshold - trigger
+        mixed_result = UncertaintyResult(
+            entropy=torch.tensor([0.5, 2.0]),
+            p_max=torch.tensor([0.8, 0.2]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([1.0, 4.0]),
+            total_score=torch.tensor([1.0, 4.0]),
+        )
+        assert controller.should_trigger_reasoning(mixed_result)
+    
     def test_should_do_bayesian(self):
         """Test Bayesian sampling trigger logic."""
         controller = UncertaintyController(tau_low=1.0)
@@ -153,6 +192,28 @@ class TestUncertaintyController:
             composite_score=torch.tensor(1.5),
         )
         assert controller.should_do_bayesian(high_result)
+    
+    def test_should_do_bayesian_batched(self):
+        """Test Bayesian sampling trigger logic with batched scores."""
+        controller = UncertaintyController(tau_low=1.0)
+        
+        # All below threshold - no Bayesian
+        low_result = UncertaintyResult(
+            entropy=torch.tensor([0.3, 0.5]),
+            p_max=torch.tensor([0.9, 0.8]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([0.5, 0.7]),
+        )
+        assert not controller.should_do_bayesian(low_result)
+        
+        # At least one above threshold - do Bayesian
+        mixed_result = UncertaintyResult(
+            entropy=torch.tensor([0.3, 1.5]),
+            p_max=torch.tensor([0.9, 0.5]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([0.5, 1.5]),
+        )
+        assert controller.should_do_bayesian(mixed_result)
     
     def test_interpret(self):
         """Test interpretation string generation."""

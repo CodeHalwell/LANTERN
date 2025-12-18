@@ -149,7 +149,7 @@ class UncertaintyController:
         Returns:
             UncertaintyLevel classification.
         """
-        # Handle batched scores by taking mean
+        # Handle batched scores by classifying each element
         if score.dim() > 0:
             return [self.classify_uncertainty(s) for s in score.reshape(-1)]
 

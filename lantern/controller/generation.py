@@ -172,7 +172,7 @@ class GenerationController:
         prob_sum = sorted_probs.sum()
         if prob_sum <= 0:
             # Fallback to greedy selection when filtering zeroes everything out
-            token_id = torch.argmax(filtered_probs).item()
+            token_id = torch.argmax(probs).item()
             return token_id, probs[token_id].item()
 
         sorted_probs = sorted_probs / prob_sum

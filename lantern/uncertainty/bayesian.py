@@ -26,7 +26,6 @@ def dropout_enabled(model: nn.Module):
     """
     # Store original training states of all modules (including the root model)
     original_states = {module: module.training for module in model.modules()}
-    original_model_state = model.training
 
     model.train()
 
@@ -36,9 +35,6 @@ def dropout_enabled(model: nn.Module):
         # Restore original states
         for module, state in original_states.items():
             module.train(state)
-
-        # Explicitly restore root model state in case modules were added/removed
-        model.train(original_model_state)
 
 
 class BayesianSampler:

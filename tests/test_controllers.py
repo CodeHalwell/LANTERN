@@ -90,6 +90,21 @@ class TestUncertaintyController:
         
         assert level == UncertaintyLevel.VERY_HIGH
     
+    def test_classify_uncertainty_batched(self):
+        """Test classification with batched scores."""
+        controller = UncertaintyController(tau_low=1.0, tau_mid=2.0, tau_high=3.0)
+        
+        # Batched scores with different levels
+        scores = torch.tensor([0.5, 1.5, 2.5, 4.0])
+        levels = controller.classify_uncertainty(scores)
+        
+        assert isinstance(levels, list)
+        assert len(levels) == 4
+        assert levels[0] == UncertaintyLevel.CONFIDENT
+        assert levels[1] == UncertaintyLevel.MODERATE
+        assert levels[2] == UncertaintyLevel.HIGH
+        assert levels[3] == UncertaintyLevel.VERY_HIGH
+    
     def test_compute_total_uncertainty(self):
         """Test combining base and epistemic uncertainty."""
         controller = UncertaintyController(epistemic_weight=0.5)
@@ -132,6 +147,30 @@ class TestUncertaintyController:
         )
         assert controller.should_trigger_reasoning(high_result)
     
+    def test_should_trigger_reasoning_batched(self):
+        """Test reasoning trigger logic with batched scores."""
+        controller = UncertaintyController(tau_high=3.0)
+        
+        # All below threshold - no trigger
+        low_result = UncertaintyResult(
+            entropy=torch.tensor([0.5, 1.0]),
+            p_max=torch.tensor([0.8, 0.7]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([1.0, 2.0]),
+            total_score=torch.tensor([1.0, 2.0]),
+        )
+        assert not controller.should_trigger_reasoning(low_result)
+        
+        # At least one above threshold - trigger
+        mixed_result = UncertaintyResult(
+            entropy=torch.tensor([0.5, 2.0]),
+            p_max=torch.tensor([0.8, 0.2]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([1.0, 4.0]),
+            total_score=torch.tensor([1.0, 4.0]),
+        )
+        assert controller.should_trigger_reasoning(mixed_result)
+    
     def test_should_do_bayesian(self):
         """Test Bayesian sampling trigger logic."""
         controller = UncertaintyController(tau_low=1.0)
@@ -153,6 +192,28 @@ class TestUncertaintyController:
             composite_score=torch.tensor(1.5),
         )
         assert controller.should_do_bayesian(high_result)
+    
+    def test_should_do_bayesian_batched(self):
+        """Test Bayesian sampling trigger logic with batched scores."""
+        controller = UncertaintyController(tau_low=1.0)
+        
+        # All below threshold - no Bayesian
+        low_result = UncertaintyResult(
+            entropy=torch.tensor([0.3, 0.5]),
+            p_max=torch.tensor([0.9, 0.8]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([0.5, 0.7]),
+        )
+        assert not controller.should_do_bayesian(low_result)
+        
+        # At least one above threshold - do Bayesian
+        mixed_result = UncertaintyResult(
+            entropy=torch.tensor([0.3, 1.5]),
+            p_max=torch.tensor([0.9, 0.5]),
+            semantic_dispersion=None,
+            composite_score=torch.tensor([0.5, 1.5]),
+        )
+        assert controller.should_do_bayesian(mixed_result)
     
     def test_interpret(self):
         """Test interpretation string generation."""
@@ -259,19 +320,71 @@ class TestGenerationController:
     def test_sample_token(self, simple_model):
         """Test token sampling."""
         model, lm_head, embeddings, _, vocab_size = simple_model
-        
+
         controller = GenerationController(
             model=model,
             lm_head=lm_head,
             embedding_matrix=embeddings,
             uncertainty_controller=UncertaintyController(),
         )
-        
+
         probs = torch.softmax(torch.randn(vocab_size), dim=-1)
-        token_id, prob = controller._sample_token(probs)
-        
+        token_id, prob = controller._sample_single_token(probs)
+
         assert 0 <= token_id < vocab_size
         assert 0.0 <= prob <= 1.0
+
+    def test_sample_token_respects_top_k_and_safe_normalization(self, simple_model):
+        """Sampling honors top-k filter and avoids zero-mass renormalization."""
+        model, lm_head, embeddings, _, vocab_size = simple_model
+
+        config = GenerationConfig(top_k=1, top_p=0.01)
+        controller = GenerationController(
+            model=model,
+            lm_head=lm_head,
+            embedding_matrix=embeddings,
+            uncertainty_controller=UncertaintyController(),
+            config=config,
+        )
+
+        # With top_k=1 only the max prob token should be sampled
+        probs = torch.zeros(vocab_size)
+        probs[5] = 0.6
+        probs[10] = 0.4
+        token_id, prob = controller._sample_single_token(probs)
+
+        assert token_id == 5
+        assert prob == pytest.approx(0.6)
+
+        # Degenerate filter where probability mass could vanish falls back to argmax
+        controller.config.top_k = 0
+        probs_zero = torch.zeros(vocab_size)
+        probs_zero[3] = 1.0
+        token_id_zero, prob_zero = controller._sample_single_token(probs_zero)
+
+        assert token_id_zero == 3
+        assert prob_zero == pytest.approx(1.0)
+
+    def test_step_handles_batched_inputs(self, simple_model):
+        """Step returns per-sample results for batched hidden states."""
+        model, lm_head, embeddings, hidden_size, _ = simple_model
+
+        controller = GenerationController(
+            model=model,
+            lm_head=lm_head,
+            embedding_matrix=embeddings,
+            uncertainty_controller=UncertaintyController(),
+        )
+
+        hidden_states = torch.randn(2, 3, hidden_size)
+
+        steps, next_tokens = controller.step(hidden_states)
+
+        assert isinstance(steps, list)
+        assert len(steps) == 2
+        assert next_tokens.shape == (2, 1)
+        assert all(isinstance(s, GenerationStep) for s in steps)
+        assert all(s.uncertainty.entropy.dim() == 0 for s in steps)
 
 
 class TestGenerationStep:

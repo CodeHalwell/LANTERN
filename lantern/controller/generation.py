@@ -140,37 +140,88 @@ class GenerationController:
         """Get logits for the last token position."""
         return self.lm_head(hidden_states[:, -1, :])
     
-    def _sample_token(
-        self,
-        probs: torch.Tensor,
-    ) -> Tuple[int, float]:
-        """
-        Sample a token from probability distribution.
-        
-        Args:
-            probs: Probability distribution [vocab_size].
-            
-        Returns:
-            Tuple of (sampled_token_id, token_probability).
-        """
+    def _sample_single_token(self, probs: torch.Tensor) -> Tuple[int, float]:
+        """Sample a token from a single probability distribution."""
+        if probs.dim() != 1:
+            raise ValueError("_sample_single_token expects a 1D probability tensor")
+
+        filtered_probs = probs.clone()
+
+        # Optional top-k filtering
+        if 0 < self.config.top_k < filtered_probs.numel():
+            top_k_probs, top_k_indices = torch.topk(filtered_probs, self.config.top_k)
+            mask = torch.ones_like(filtered_probs, dtype=torch.bool)
+            mask[top_k_indices] = False
+            filtered_probs[mask] = 0
+        elif self.config.top_k == 0:
+            # Degenerate case: disable all tokens, fall back to argmax
+            top_token = torch.argmax(filtered_probs).item()
+            return top_token, probs[top_token].item()
+
         # Apply top-p (nucleus) sampling
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        sorted_probs, sorted_indices = torch.sort(filtered_probs, descending=True)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        
+
         # Remove tokens with cumulative probability above threshold
         sorted_indices_to_remove = cumulative_probs > self.config.top_p
-        # Always keep the highest probability token (first after sorting)
-        sorted_indices_to_remove[..., 0] = False
-        
-        sorted_probs[sorted_indices_to_remove] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum()  # Renormalize
-        
-        # Sample
+        if sorted_indices_to_remove.numel() > 0:
+            sorted_indices_to_remove[..., 0] = False
+
+        sorted_probs = sorted_probs.masked_fill(sorted_indices_to_remove, 0)
+
+        prob_sum = sorted_probs.sum()
+        if prob_sum <= 0:
+            # Fallback to greedy selection when filtering zeroes everything out
+            token_id = torch.argmax(probs).item()
+            return token_id, probs[token_id].item()
+
+        sorted_probs = sorted_probs / prob_sum
+
         token_idx = torch.multinomial(sorted_probs, num_samples=1)
         token_id = sorted_indices[token_idx].item()
         token_prob = probs[token_id].item()
-        
+
         return token_id, token_prob
+
+    def _sample_tokens(self, probs: torch.Tensor) -> Tuple[torch.Tensor, List[float]]:
+        """Sample tokens for batched or single distributions."""
+        if probs.dim() == 1:
+            token_id, token_prob = self._sample_single_token(probs)
+            return torch.tensor([token_id], device=probs.device), [token_prob]
+
+        if probs.dim() == 2:
+            token_ids = []
+            token_probs: List[float] = []
+            for row in probs:
+                tid, tprob = self._sample_single_token(row)
+                token_ids.append(tid)
+                token_probs.append(tprob)
+
+            return torch.tensor(token_ids, device=probs.device), token_probs
+
+        raise ValueError("Probabilities must be 1D or 2D tensor for sampling")
+
+    def _slice_uncertainty(self, uncertainty: UncertaintyResult, idx: int) -> UncertaintyResult:
+        """Extract a per-sample uncertainty view for batched inputs."""
+
+        def _slice(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor) and value.dim() > 0:
+                return value[idx]
+            if isinstance(value, list):
+                return value[idx]
+            return value
+
+        return UncertaintyResult(
+            entropy=_slice(uncertainty.entropy),
+            p_max=_slice(uncertainty.p_max),
+            semantic_dispersion=_slice(uncertainty.semantic_dispersion),
+            composite_score=_slice(uncertainty.composite_score),
+            epistemic_uncertainty=_slice(uncertainty.epistemic_uncertainty),
+            total_score=_slice(uncertainty.total_score),
+            level=_slice(uncertainty.level),
+        )
     
     def _switch_to_reasoning_mode(self):
         """Switch to reasoning mode with deeper recursion."""
@@ -205,11 +256,12 @@ class GenerationController:
         # 1. Forward pass
         h = self._forward(hidden_states)
         logits = self._get_logits(h)
-        
-        # 2. Compute base uncertainty
+        batch_size = logits.shape[0] if logits.dim() > 1 else 1
+
+        # 2. Compute base uncertainty without dropping batch context
         probs = F.softmax(logits / self.config.temperature, dim=-1)
         uncertainty = self.uncertainty_controller.compute_base_uncertainty(
-            logits.squeeze(0),
+            logits,
             self.embedding_matrix,
         )
         
@@ -226,11 +278,11 @@ class GenerationController:
                 num_samples=self.config.num_bayesian_samples,
                 steps=self.current_steps,
             )
-            
+
             # Update uncertainty with epistemic component
             uncertainty = self.uncertainty_controller.compute_total_uncertainty(
                 uncertainty,
-                epistemic.squeeze(0) if epistemic.dim() > 0 else epistemic,
+                epistemic,
             )
             
             # Use refined probabilities
@@ -246,28 +298,47 @@ class GenerationController:
         if self.uncertainty_controller.should_trigger_reasoning(uncertainty):
             # Trigger reasoning mode
             self._switch_to_reasoning_mode()
-            
+
             # If we have a THINK token, return it
             if self.config.think_token_id is not None:
-                return GenerationStep(
-                    token_id=self.config.think_token_id,
-                    probability=1.0,
-                    uncertainty=uncertainty,
-                    mode=self.current_mode,
-                    used_bayesian=used_bayesian,
-                ), torch.tensor([[self.config.think_token_id]], device=hidden_states.device)
-        
+                next_token = torch.full(
+                    (batch_size, 1),
+                    self.config.think_token_id,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+                steps = [
+                    GenerationStep(
+                        token_id=self.config.think_token_id,
+                        probability=1.0,
+                        uncertainty=self._slice_uncertainty(uncertainty, i)
+                        if batch_size > 1
+                        else uncertainty,
+                        mode=self.current_mode,
+                        used_bayesian=used_bayesian,
+                    )
+                    for i in range(batch_size)
+                ]
+                return (steps[0] if batch_size == 1 else steps), next_token
+
         # 5. Sample token
-        probs_squeezed = probs.squeeze(0) if probs.dim() > 1 else probs
-        token_id, token_prob = self._sample_token(probs_squeezed)
-        
-        return GenerationStep(
-            token_id=token_id,
-            probability=token_prob,
-            uncertainty=uncertainty,
-            mode=self.current_mode,
-            used_bayesian=used_bayesian,
-        ), torch.tensor([[token_id]], device=hidden_states.device)
+        token_ids, token_probs = self._sample_tokens(probs)
+        next_tokens = token_ids.unsqueeze(-1)
+
+        steps = [
+            GenerationStep(
+                token_id=token_ids[i].item(),
+                probability=token_probs[i],
+                uncertainty=self._slice_uncertainty(uncertainty, i)
+                if batch_size > 1
+                else uncertainty,
+                mode=self.current_mode,
+                used_bayesian=used_bayesian,
+            )
+            for i in range(batch_size)
+        ]
+
+        return (steps[0] if batch_size == 1 else steps), next_tokens
     
     def generate(
         self,
@@ -296,12 +367,16 @@ class GenerationController:
         step_info: List[GenerationStep] = []
         
         hidden_states = input_hidden_states
-        
+
         for _ in range(max_t):
             step, next_token = self.step(hidden_states)
-            
-            generated_tokens.append(step.token_id)
-            step_info.append(step)
+
+            if isinstance(step, list):
+                generated_tokens.extend([s.token_id for s in step])
+                step_info.extend(step)
+            else:
+                generated_tokens.append(step.token_id)
+                step_info.append(step)
             
             # Check for EOS
             if step.token_id == self.config.eos_token_id:

@@ -7,7 +7,7 @@ epistemic variance) into a composite score for decision making.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
@@ -32,7 +32,7 @@ class UncertaintyResult:
     composite_score: torch.Tensor
     epistemic_uncertainty: Optional[torch.Tensor] = None
     total_score: Optional[torch.Tensor] = None
-    level: Optional[UncertaintyLevel] = None
+    level: Optional[Union[UncertaintyLevel, List[UncertaintyLevel]]] = None
 
 
 class UncertaintyController:
@@ -151,10 +151,10 @@ class UncertaintyController:
         """
         # Handle batched scores by taking mean
         if score.dim() > 0:
-            score = score.mean()
-        
+            return [self.classify_uncertainty(s) for s in score.reshape(-1)]
+
         score_val = score.item()
-        
+
         if score_val < self.tau_low:
             return UncertaintyLevel.CONFIDENT
         elif score_val < self.tau_mid:
@@ -206,7 +206,9 @@ class UncertaintyController:
             True if reasoning should be triggered.
         """
         score = result.total_score if result.total_score is not None else result.composite_score
-        return score.mean().item() >= self.tau_high
+        if isinstance(score, torch.Tensor) and score.dim() > 0:
+            return bool((score >= self.tau_high).any())
+        return score.item() >= self.tau_high
     
     def should_do_bayesian(
         self,
@@ -223,7 +225,10 @@ class UncertaintyController:
         Returns:
             True if Bayesian sampling should be performed.
         """
-        return result.composite_score.mean().item() >= self.tau_low
+        score = result.composite_score
+        if isinstance(score, torch.Tensor) and score.dim() > 0:
+            return bool((score >= self.tau_low).any())
+        return score.item() >= self.tau_low
     
     def interpret(
         self,
@@ -239,7 +244,16 @@ class UncertaintyController:
             Interpretation string.
         """
         level = result.level or self.classify_uncertainty(result.composite_score)
-        
+
+        if isinstance(level, list):
+            priority = {
+                UncertaintyLevel.CONFIDENT: 0,
+                UncertaintyLevel.MODERATE: 1,
+                UncertaintyLevel.HIGH: 2,
+                UncertaintyLevel.VERY_HIGH: 3,
+            }
+            level = max(level, key=lambda l: priority[l])
+
         interpretations = {
             UncertaintyLevel.CONFIDENT: "Model is confident. Normal sampling recommended.",
             UncertaintyLevel.MODERATE: "Moderate uncertainty. Consider refined sampling.",

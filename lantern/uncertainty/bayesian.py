@@ -17,28 +17,28 @@ import torch.nn.functional as F
 def dropout_enabled(model: nn.Module):
     """
     Context manager to enable dropout at inference time.
-    
+
     Temporarily sets the model to training mode to enable dropout,
     then restores the original mode.
     
     Args:
         model: PyTorch model with dropout layers.
     """
-    # Store original training states of all modules
-    original_states = {}
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Dropout):
-            original_states[name] = module.training
-            module.train()
-    
+    # Store original training states of all modules (including the root model)
+    original_states = {module: module.training for module in model.modules()}
+    original_model_state = model.training
+
+    model.train()
+
     try:
         yield
     finally:
         # Restore original states
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Dropout) and name in original_states:
-                if not original_states[name]:
-                    module.eval()
+        for module, state in original_states.items():
+            module.train(state)
+
+        # Explicitly restore root model state in case modules were added/removed
+        model.train(original_model_state)
 
 
 class BayesianSampler:

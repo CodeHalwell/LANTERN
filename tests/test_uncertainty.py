@@ -235,15 +235,18 @@ class TestBayesian:
             torch.nn.Linear(10, 10),
         )
         model.eval()
-        
+
         # Dropout should be disabled in eval
         assert not model[1].training
-        
+        assert not model.training
+
         with dropout_enabled(model):
             assert model[1].training
-        
+            assert model.training
+
         # Should be restored after context
         assert not model[1].training
+        assert not model.training
     
     def test_bayesian_sampler(self):
         """Test BayesianSampler class."""

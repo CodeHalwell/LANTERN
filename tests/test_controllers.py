@@ -259,19 +259,71 @@ class TestGenerationController:
     def test_sample_token(self, simple_model):
         """Test token sampling."""
         model, lm_head, embeddings, _, vocab_size = simple_model
-        
+
         controller = GenerationController(
             model=model,
             lm_head=lm_head,
             embedding_matrix=embeddings,
             uncertainty_controller=UncertaintyController(),
         )
-        
+
         probs = torch.softmax(torch.randn(vocab_size), dim=-1)
-        token_id, prob = controller._sample_token(probs)
-        
+        token_id, prob = controller._sample_single_token(probs)
+
         assert 0 <= token_id < vocab_size
         assert 0.0 <= prob <= 1.0
+
+    def test_sample_token_respects_top_k_and_safe_normalization(self, simple_model):
+        """Sampling honors top-k filter and avoids zero-mass renormalization."""
+        model, lm_head, embeddings, _, vocab_size = simple_model
+
+        config = GenerationConfig(top_k=1, top_p=0.01)
+        controller = GenerationController(
+            model=model,
+            lm_head=lm_head,
+            embedding_matrix=embeddings,
+            uncertainty_controller=UncertaintyController(),
+            config=config,
+        )
+
+        # With top_k=1 only the max prob token should be sampled
+        probs = torch.zeros(vocab_size)
+        probs[5] = 0.6
+        probs[10] = 0.4
+        token_id, prob = controller._sample_single_token(probs)
+
+        assert token_id == 5
+        assert prob == pytest.approx(0.6)
+
+        # Degenerate filter where probability mass could vanish falls back to argmax
+        controller.config.top_k = 0
+        probs_zero = torch.zeros(vocab_size)
+        probs_zero[3] = 1.0
+        token_id_zero, prob_zero = controller._sample_single_token(probs_zero)
+
+        assert token_id_zero == 3
+        assert prob_zero == pytest.approx(1.0)
+
+    def test_step_handles_batched_inputs(self, simple_model):
+        """Step returns per-sample results for batched hidden states."""
+        model, lm_head, embeddings, hidden_size, _ = simple_model
+
+        controller = GenerationController(
+            model=model,
+            lm_head=lm_head,
+            embedding_matrix=embeddings,
+            uncertainty_controller=UncertaintyController(),
+        )
+
+        hidden_states = torch.randn(2, 3, hidden_size)
+
+        steps, next_tokens = controller.step(hidden_states)
+
+        assert isinstance(steps, list)
+        assert len(steps) == 2
+        assert next_tokens.shape == (2, 1)
+        assert all(isinstance(s, GenerationStep) for s in steps)
+        assert all(s.uncertainty.entropy.dim() == 0 for s in steps)
 
 
 class TestGenerationStep:

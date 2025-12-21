@@ -65,6 +65,7 @@ class LANTERNModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         # Tie embeddings (weight sharing between input and output)
+        # Note: This is done before initialization, so both will be initialized together
         self.lm_head.weight = self.token_embedding.weight
         
         # Initialize weights
@@ -105,6 +106,13 @@ class LANTERNModel(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        
+        # Validate sequence length
+        if seq_len > self.config.max_position:
+            raise ValueError(
+                f"Input sequence length ({seq_len}) exceeds maximum position "
+                f"embeddings ({self.config.max_position}). Consider truncating the input."
+            )
         
         # Get embeddings
         token_embeds = self.token_embedding(input_ids)

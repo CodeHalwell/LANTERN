@@ -2,7 +2,6 @@
 Tests for LANTERN model and training components.
 """
 
-import pytest
 import torch
 import tempfile
 import os
@@ -202,7 +201,12 @@ class TestTrainingComponents:
             
             # Create new model and load checkpoint
             new_model = LANTERNModel(config)
-            loaded_checkpoint = torch.load(checkpoint_path)
+            try:
+                # Try secure loading first
+                loaded_checkpoint = torch.load(checkpoint_path, weights_only=True)
+            except TypeError:
+                # Fallback for older PyTorch
+                loaded_checkpoint = torch.load(checkpoint_path)
             new_model.load_state_dict(loaded_checkpoint['model_state_dict'])
             
             # Check that parameters match

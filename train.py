@@ -7,18 +7,18 @@ language modeling, similar to GPT-style models.
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from lantern.models.lantern_model import LANTERNModel
-from lantern.utils.config import LANTERNConfig, create_small_config, create_base_config
+from lantern.utils.config import create_small_config, create_base_config
 
 
 class TextDataset(Dataset):
@@ -68,7 +68,13 @@ class TextDataset(Dataset):
     
     def __len__(self) -> int:
         """Return number of sequences in dataset."""
-        return max(1, len(self.data) - self.seq_length - 1)
+        data_len = len(self.data)
+        if data_len < self.seq_length + 1:
+            raise ValueError(
+                f"Dataset is too short ({data_len} tokens) for sequence length "
+                f"{self.seq_length}. Need at least {self.seq_length + 1} tokens."
+            )
+        return data_len - self.seq_length - 1
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -206,14 +212,28 @@ class Trainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        try:
+            # Try to load with weights_only=True for security (PyTorch >= 1.13)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        except TypeError:
+            # Fallback for older PyTorch versions
+            print("Warning: Loading checkpoint without weights_only protection. "
+                  "Only load checkpoints from trusted sources.")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}: {e}")
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.step = checkpoint['step']
-        self.epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint['best_val_loss']
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.step = checkpoint['step']
+            self.epoch = checkpoint['epoch']
+            self.best_val_loss = checkpoint['best_val_loss']
+        except KeyError as e:
+            raise RuntimeError(f"Checkpoint is missing required key: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to restore training state: {e}")
         
         print(f"Checkpoint loaded from {checkpoint_path}")
         print(f"Resuming from step {self.step}, epoch {self.epoch}")
@@ -333,17 +353,20 @@ class Trainer:
             # Evaluation
             if self.step % self.eval_interval == 0:
                 val_loss = self.evaluate()
-                print(f"Validation loss: {val_loss:.4f}")
                 
-                self.log_metrics({
-                    'step': self.step,
-                    'val_loss': val_loss,
-                })
-                
-                # Save best model
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self.save_checkpoint("best_model.pt")
+                # Only save best model if we have validation data
+                if not math.isnan(val_loss):
+                    print(f"Validation loss: {val_loss:.4f}")
+                    
+                    self.log_metrics({
+                        'step': self.step,
+                        'val_loss': val_loss,
+                    })
+                    
+                    # Save best model
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint("best_model.pt")
             
             # Save checkpoint
             if self.step % self.save_interval == 0:

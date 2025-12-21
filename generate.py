@@ -9,7 +9,7 @@ import torch
 
 from lantern.models.lantern_model import LANTERNModel
 from lantern.utils.config import LANTERNConfig
-from lantern import UncertaintyController, GenerationController
+from lantern import UncertaintyController
 from lantern.controller.generation import GenerationConfig
 
 
@@ -26,7 +26,14 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> tuple:
     """
     print(f"Loading model from {checkpoint_path}...")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        # Try to load with weights_only=True for security (PyTorch >= 1.13)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Fallback for older PyTorch versions
+        print("Warning: Loading checkpoint without weights_only protection. "
+              "Only load checkpoints from trusted sources.")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Create config from checkpoint
     config_dict = checkpoint['config']
@@ -84,13 +91,13 @@ def generate_simple(
     return output
 
 
-def generate_with_uncertainty(
+def demonstrate_uncertainty_setup(
     model: LANTERNModel,
     config: LANTERNConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int = 50,
     temperature: float = 0.8,
-) -> tuple:
+) -> None:
     """
     Demonstrate uncertainty-aware generation setup.
     
@@ -109,9 +116,6 @@ def generate_with_uncertainty(
         input_ids: Input token IDs [1, seq_len].
         max_new_tokens: Number of tokens to generate.
         temperature: Sampling temperature.
-        
-    Returns:
-        Tuple of (None, None) - demonstration only.
     """
     print("\n" + "=" * 60)
     print("Uncertainty-Aware Generation Setup (Demonstration)")
@@ -152,8 +156,6 @@ def generate_with_uncertainty(
     print("with proper hidden state management and embedding layers.")
     print("See lantern.controller.generation.GenerationController for")
     print("the complete implementation.")
-    
-    return None, None
 
 
 def main():
@@ -232,7 +234,8 @@ def main():
     
     # Generate
     if args.use_uncertainty:
-        output, step_info = generate_with_uncertainty(
+        # Demonstrate uncertainty setup (returns None)
+        demonstrate_uncertainty_setup(
             model,
             config,
             input_ids,

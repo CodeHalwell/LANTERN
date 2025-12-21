@@ -1,0 +1,10 @@
+The LANTERN architecture is a novel approach to language modeling that combines recursive transformers with uncertainty estimation.
+It uses sparse attention patterns to reduce computational complexity while maintaining model quality.
+The key innovation is the ability to dynamically adjust computation depth based on uncertainty signals.
+When the model encounters difficult or ambiguous inputs, it can trigger reasoning mode with deeper recursion.
+This allows for efficient inference on easy cases while providing additional computation for hard cases.
+The uncertainty estimation combines multiple signals including entropy, semantic dispersion, and epistemic uncertainty.
+Bayesian sampling through MC dropout provides a measure of model confidence in its predictions.
+The system can inject special THINK tokens to enable chain-of-thought style reasoning when needed.
+This makes LANTERN particularly well-suited for tasks requiring both efficiency and careful reasoning.
+The recursive transformer architecture enables parameter-efficient scaling through weight sharing across depth.

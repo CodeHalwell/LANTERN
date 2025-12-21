@@ -92,7 +92,16 @@ def generate_with_uncertainty(
     temperature: float = 0.8,
 ) -> tuple:
     """
-    Generate with uncertainty-aware control.
+    Demonstrate uncertainty-aware generation setup.
+    
+    Note: Full uncertainty-aware generation requires proper hidden state management
+    across generation steps, which is beyond the scope of this simple example.
+    This function shows how to set up the necessary components.
+    
+    For a complete implementation, you would need to:
+    1. Maintain hidden states across generation steps
+    2. Embed generated tokens and append to the sequence
+    3. Re-run the model with updated context
     
     Args:
         model: LANTERN model.
@@ -102,10 +111,10 @@ def generate_with_uncertainty(
         temperature: Sampling temperature.
         
     Returns:
-        Tuple of (generated tokens, step info).
+        Tuple of (None, None) - demonstration only.
     """
     print("\n" + "=" * 60)
-    print("Uncertainty-Aware Generation")
+    print("Uncertainty-Aware Generation Setup (Demonstration)")
     print("=" * 60)
     
     # Create uncertainty controller
@@ -130,25 +139,19 @@ def generate_with_uncertainty(
         num_bayesian_samples=5,
     )
     
-    # Create generation controller
-    controller = GenerationController(
-        model=model.transformer,
-        lm_head=model.lm_head,
-        embedding_matrix=model.get_embedding_matrix(),
-        uncertainty_controller=uncertainty_controller,
-        config=gen_config,
-        recur_fn=lambda h, steps_max: model.transformer(
-            h, steps_per_block=steps_max
-        ),
-    )
+    print(f"Uncertainty Controller configured:")
+    print(f"  tau_low: {uncertainty_controller.tau_low}")
+    print(f"  tau_mid: {uncertainty_controller.tau_mid}")
+    print(f"  tau_high: {uncertainty_controller.tau_high}")
+    print(f"\nGeneration Config:")
+    print(f"  Base recursion steps: {gen_config.steps_base}")
+    print(f"  Reasoning steps: {gen_config.steps_reasoning}")
+    print(f"  Bayesian samples: {gen_config.num_bayesian_samples}")
     
-    # Get initial hidden states
-    with torch.no_grad():
-        _, hidden_states = model(input_ids, return_hidden_states=True)
-    
-    # Generate
-    print("Note: Full uncertainty-aware generation requires proper hidden state")
-    print("management. This is a simplified demonstration.")
+    print("\nNote: Full uncertainty-aware generation requires integration")
+    print("with proper hidden state management and embedding layers.")
+    print("See lantern.controller.generation.GenerationController for")
+    print("the complete implementation.")
     
     return None, None
 

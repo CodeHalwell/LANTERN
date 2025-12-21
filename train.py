@@ -152,7 +152,7 @@ class Trainer:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=2,
             pin_memory=True,
         )
         
@@ -161,7 +161,7 @@ class Trainer:
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=0,
+                num_workers=2,
                 pin_memory=True,
             )
         else:

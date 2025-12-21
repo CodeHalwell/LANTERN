@@ -191,7 +191,9 @@ class LANTERNModel(nn.Module):
         
         for _ in range(max_new_tokens):
             # Crop context if needed
-            if input_ids.shape[1] > self.config.max_position:
+            seq_len = input_ids.shape[1]
+            if seq_len > self.config.max_position:
+                # Keep only the most recent max_position tokens
                 input_ids = input_ids[:, -self.config.max_position:]
             
             # Forward pass

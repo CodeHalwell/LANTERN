@@ -11,6 +11,10 @@ from lantern.models.lantern_model import LANTERNModel
 from lantern.utils.config import create_small_config, LANTERNConfig
 
 
+# Test constants
+TEST_VOCAB_SIZE = 100
+
+
 class TestLANTERNModel:
     """Tests for the complete LANTERN model."""
     
@@ -97,7 +101,7 @@ class TestLANTERNModel:
     def test_generate(self):
         """Test simple generation."""
         config = create_small_config()
-        config.vocab_size = 100  # Smaller vocab for faster test
+        config.vocab_size = TEST_VOCAB_SIZE
         model = LANTERNModel(config)
         model.eval()
         
@@ -116,7 +120,7 @@ class TestLANTERNModel:
     def test_generate_with_eos(self):
         """Test generation with EOS token."""
         config = create_small_config()
-        config.vocab_size = 100
+        config.vocab_size = TEST_VOCAB_SIZE
         model = LANTERNModel(config)
         model.eval()
         
@@ -157,7 +161,7 @@ class TestTrainingComponents:
     def test_model_forward_backward(self):
         """Test that gradients flow correctly."""
         config = create_small_config()
-        config.vocab_size = 100
+        config.vocab_size = TEST_VOCAB_SIZE
         model = LANTERNModel(config)
         
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
@@ -182,7 +186,7 @@ class TestTrainingComponents:
     def test_checkpoint_save_load(self):
         """Test saving and loading checkpoints."""
         config = create_small_config()
-        config.vocab_size = 100
+        config.vocab_size = TEST_VOCAB_SIZE
         model = LANTERNModel(config)
         
         # Save checkpoint
@@ -212,7 +216,7 @@ class TestTrainingComponents:
     def test_optimizer_step(self):
         """Test optimizer step."""
         config = create_small_config()
-        config.vocab_size = 100
+        config.vocab_size = TEST_VOCAB_SIZE
         model = LANTERNModel(config)
         
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)

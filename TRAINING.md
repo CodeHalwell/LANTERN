@@ -134,8 +134,15 @@ config = create_base_config()
 # Create model
 model = LANTERNModel(config)
 
-# Load checkpoint
-checkpoint = torch.load("./outputs/best_model.pt")
+# Load checkpoint securely
+try:
+    # Use weights_only=True for security (PyTorch >= 1.13)
+    checkpoint = torch.load("./outputs/best_model.pt", weights_only=True)
+except TypeError:
+    # Fallback for older PyTorch versions
+    # WARNING: Only load checkpoints from trusted sources
+    checkpoint = torch.load("./outputs/best_model.pt")
+
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 

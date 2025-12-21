@@ -8,6 +8,8 @@ This directory contains example scripts and data for training LANTERN models.
 
 Verify the training pipeline works:
 
+**Note**: The provided `example_data.txt` is a small demonstration file. For meaningful training, use a larger dataset or reduce `seq_length` to 64 or lower.
+
 ```bash
 python train.py \
     --config small \

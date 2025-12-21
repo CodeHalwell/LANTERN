@@ -6,6 +6,7 @@ language modeling, similar to GPT-style models.
 """
 
 import argparse
+from dataclasses import asdict
 import json
 import math
 import os
@@ -74,7 +75,7 @@ class TextDataset(Dataset):
                 f"Dataset is too short ({data_len} tokens) for sequence length "
                 f"{self.seq_length}. Need at least {self.seq_length + 1} tokens."
             )
-        return data_len - self.seq_length - 1
+        return data_len - self.seq_length
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -119,6 +120,7 @@ class Trainer:
         save_interval: int = 1000,
         warmup_steps: int = 100,
         grad_clip: float = 1.0,
+        num_workers: int = 0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         """
@@ -137,6 +139,7 @@ class Trainer:
             save_interval: Steps between checkpoint saves.
             warmup_steps: Learning rate warmup steps.
             grad_clip: Gradient clipping threshold.
+            num_workers: Number of data loading workers (0 for single-threaded).
             device: Device to train on.
         """
         self.model = model.to(device)
@@ -158,7 +161,7 @@ class Trainer:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=num_workers,
             pin_memory=True,
         )
         
@@ -167,7 +170,7 @@ class Trainer:
                 val_dataset,
                 batch_size=batch_size,
                 shuffle=False,
-                num_workers=2,
+                num_workers=num_workers,
                 pin_memory=True,
             )
         else:
@@ -181,7 +184,9 @@ class Trainer:
             betas=(0.9, 0.95),
         )
         
-        # Learning rate scheduler with warmup
+        # Learning rate scheduler with linear warmup
+        # After warmup, LR stays constant (no decay schedule)
+        # warmup_steps=0 means no warmup (immediate full LR)
         self.lr_lambda = lambda step: min(1.0, step / warmup_steps) if warmup_steps > 0 else 1.0
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self.lr_lambda)
         
@@ -204,7 +209,7 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'config': self.model.config.__dict__,
+            'config': asdict(self.model.config),
         }
         
         torch.save(checkpoint, checkpoint_path)
@@ -378,7 +383,10 @@ class Trainer:
         print("=" * 60)
         print("Training completed!")
         print(f"Total time: {time.time() - start_time:.1f}s")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
+        if math.isinf(self.best_val_loss):
+            print("Best validation loss: N/A (no validation performed)")
+        else:
+            print(f"Best validation loss: {self.best_val_loss:.4f}")
         print("=" * 60)
 
 
@@ -495,6 +503,12 @@ def main():
         help="Gradient clipping threshold",
     )
     parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="Number of data loading workers (0 for single-threaded, recommended for compatibility)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -566,6 +580,7 @@ def main():
         save_interval=args.save_interval,
         warmup_steps=args.warmup_steps,
         grad_clip=args.grad_clip,
+        num_workers=args.num_workers,
         device=args.device,
     )
     

@@ -212,7 +212,10 @@ class LANTERNModel(nn.Module):
             
             # Apply top-k filtering
             if top_k > 0:
-                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                # Ensure k does not exceed vocabulary size
+                k = min(top_k, logits.size(-1))
+                topk_values = torch.topk(logits, k)[0]
+                indices_to_remove = logits < topk_values[..., -1, None]
                 logits[indices_to_remove] = float('-inf')
             
             # Apply top-p (nucleus) filtering

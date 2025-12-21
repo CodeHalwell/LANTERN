@@ -8,3 +8,13 @@ Bayesian sampling through MC dropout provides a measure of model confidence in i
 The system can inject special THINK tokens to enable chain-of-thought style reasoning when needed.
 This makes LANTERN particularly well-suited for tasks requiring both efficiency and careful reasoning.
 The recursive transformer architecture enables parameter-efficient scaling through weight sharing across depth.
+In practice, LANTERN is trained on large-scale corpora that include diverse domains such as technical writing, conversational dialogue, and formal reasoning benchmarks.
+During pretraining, the model learns to predict the next token while simultaneously estimating its own uncertainty about each prediction, building robust internal confidence signals.
+These confidence signals are later used at inference time to decide whether shallow or deep computation is needed for a particular input.
+When the uncertainty remains low, the model terminates early, saving computational resources and reducing latency without sacrificing accuracy on simple tasks.
+When the uncertainty becomes high, the model allocates more depth, enabling richer internal deliberation over multiple recursive passes.
+This dynamic allocation of computation makes LANTERN especially suitable for real-time systems where response time and resource usage must be carefully controlled.
+Another important aspect of the LANTERN design is its modular attention mechanism, which separates local pattern recognition from long-range reasoning.
+Local attention heads focus on short spans of text to capture syntax, morphology, and nearby semantic relations.
+Global attention heads track entities, discourse structure, and cross-sentence dependencies that can span entire documents.
+By combining these two views, the model can maintain coherence across long contexts while still being efficient on short ones.

@@ -29,6 +29,16 @@ For development:
 pip install -e ".[dev]"
 ```
 
+## Training
+
+To train LANTERN on text generation tasks (like GPT):
+
+```bash
+python train.py --data_path your_data.txt --config base
+```
+
+See [TRAINING.md](TRAINING.md) for detailed training instructions, configuration options, and examples.
+
 ## Quick Start
 
 ```python

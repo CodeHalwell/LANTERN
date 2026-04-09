@@ -18,7 +18,7 @@ class TestAdaptiveEMAThresholds:
         assert ctrl._ema_initialized is False
 
     def test_ema_updates_after_update_call(self):
-        """Calling _update_ema should initialise and update the running stats."""
+        """Calling _update_ema should initialize and update the running stats."""
         ctrl = UncertaintyController(ema_decay=0.9)
         batch = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
         ctrl._update_ema(batch)

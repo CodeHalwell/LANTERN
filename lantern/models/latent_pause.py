@@ -90,9 +90,10 @@ class LatentPauseModule(nn.Module):
         steps = min(num_steps, self.max_pause_steps)
         for i in range(steps):
             # Add pause step embedding
-            pause_emb = self.pause_embeddings(
-                torch.tensor(i, device=hidden_states.device)
+            pause_idx = torch.tensor(
+                i, device=hidden_states.device, dtype=torch.long
             )
+            pause_emb = self.pause_embeddings(pause_idx)
             h = hidden_states + pause_emb
 
             # Attention with context awareness

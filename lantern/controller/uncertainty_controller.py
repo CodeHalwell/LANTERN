@@ -160,7 +160,14 @@ class UncertaintyController:
         
         Both signals are expected to be sigmoid-bounded [0, 1].
         """
-        score = torch.tensor(0.0)
+        # Determine device from inputs to avoid CPU/GPU mismatch
+        device = None
+        if semantic_dispersion is not None:
+            device = semantic_dispersion.device
+        elif epistemic_uncertainty is not None:
+            device = epistemic_uncertainty.device
+
+        score = torch.tensor(0.0, device=device)
         
         if semantic_dispersion is not None:
             score = score + self.dispersion_weight * semantic_dispersion

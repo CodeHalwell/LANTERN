@@ -20,7 +20,7 @@ Phase 3: Controller Unlock
 """
 
 import random
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Optional
 
 import torch
@@ -308,7 +308,7 @@ class Phase3Trainer:
         ctx = (
             torch.autocast(device_type=self.device, dtype=amp_dtype)
             if amp_dtype is not None
-            else _null_context()
+            else nullcontext()
         )
 
         with ctx:
@@ -350,13 +350,3 @@ class Phase3Trainer:
             "ponder_cost": masked_ponder.item(),
             "ponder_lambda": current_lambda,
         }
-
-
-class _null_context:
-    """No-op context manager for when autocast is not needed."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass

@@ -150,9 +150,10 @@ class RecursiveTransformerBlock(nn.Module):
         """
         # Add step embedding if step index is provided
         if step_index is not None and step_index < self.max_steps:
-            step_emb = self.step_embeddings(
-                torch.tensor(step_index, device=hidden_states.device)
+            step_idx_tensor = torch.tensor(
+                step_index, device=hidden_states.device, dtype=torch.long
             )
+            step_emb = self.step_embeddings(step_idx_tensor)
             hidden_states = hidden_states + step_emb
         
         # Pre-norm attention

@@ -3,6 +3,12 @@ LANTERN Language Model.
 
 Complete model implementation combining embeddings, recursive transformer stack,
 and language model head for text generation tasks.
+
+v3-final features:
+- Step embeddings via recursive transformer
+- Epistemic probe for uncertainty estimation
+- Latent pause reasoning module
+- Differentiable ACT ponder cost
 """
 
 from typing import Optional, Tuple
@@ -12,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lantern.models.recursive_transformer import RecursiveTransformerStack
+from lantern.models.latent_pause import LatentPauseModule
+from lantern.uncertainty.epistemic_probe import EpistemicProbe
 from lantern.utils.config import LANTERNConfig
 
 
@@ -21,7 +29,9 @@ class LANTERNModel(nn.Module):
     
     Integrates:
     - Token embeddings with positional encoding
-    - Recursive transformer stack
+    - Recursive transformer stack with step embeddings
+    - Epistemic probe for uncertainty estimation
+    - Latent pause reasoning module
     - Language model head for next-token prediction
     """
     
@@ -56,6 +66,21 @@ class LANTERNModel(nn.Module):
             window_size=config.window_size,
             dropout=config.dropout,
             use_halting=config.use_adaptive_halting,
+            max_steps=config.max_steps,
+        )
+        
+        # Epistemic probe for uncertainty estimation
+        self.epistemic_probe = EpistemicProbe(config.hidden_size)
+        
+        # Latent pause reasoning module
+        self.pause_module = LatentPauseModule(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_heads,
+            intermediate_size=config.intermediate_size,
+            max_pause_steps=config.max_pause_steps,
+            window_size=config.window_size,
+            dropout=config.dropout,
+            use_rope=config.use_rope,
         )
         
         # Final layer norm
@@ -65,7 +90,6 @@ class LANTERNModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         # Tie embeddings (weight sharing between input and output)
-        # Note: This is done before initialization, so both will be initialized together
         self.lm_head.weight = self.token_embedding.weight
         
         # Initialize weights
@@ -90,7 +114,7 @@ class LANTERNModel(nn.Module):
         steps_per_block: Optional[int] = None,
         use_adaptive_halting: bool = False,
         return_hidden_states: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Forward pass through LANTERN model.
         
@@ -102,7 +126,7 @@ class LANTERNModel(nn.Module):
             return_hidden_states: Whether to return hidden states.
             
         Returns:
-            Tuple of (logits [batch, seq_len, vocab_size], hidden_states if requested).
+            Tuple of (logits, hidden_states or None, ponder_cost or None).
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -126,7 +150,7 @@ class LANTERNModel(nn.Module):
         
         # Pass through recursive transformer stack
         steps = steps_per_block if steps_per_block is not None else self.config.steps_base
-        hidden_states, total_steps = self.transformer(
+        hidden_states, total_steps, ponder_cost = self.transformer(
             hidden_states,
             steps_per_block=steps,
             attention_mask=attention_mask,
@@ -140,8 +164,8 @@ class LANTERNModel(nn.Module):
         logits = self.lm_head(hidden_states)
         
         if return_hidden_states:
-            return logits, hidden_states
-        return logits, None
+            return logits, hidden_states, ponder_cost
+        return logits, None, ponder_cost
     
     def get_embedding_matrix(self) -> torch.Tensor:
         """
@@ -182,7 +206,7 @@ class LANTERNModel(nn.Module):
         Simple generation method for inference.
         
         Note: This is a basic generation loop. For uncertainty-aware generation
-        with THINK tokens and adaptive recursion, use GenerationController.
+        with latent pause reasoning and adaptive recursion, use GenerationController.
         
         Args:
             input_ids: Input token IDs [batch, seq_len].
@@ -201,18 +225,16 @@ class LANTERNModel(nn.Module):
             # Crop context if needed
             seq_len = input_ids.shape[1]
             if seq_len > self.config.max_position:
-                # Keep only the most recent max_position tokens
                 input_ids = input_ids[:, -self.config.max_position:]
             
             # Forward pass
-            logits, _ = self.forward(input_ids)
+            logits, _, _ = self.forward(input_ids)
             
             # Get logits for last position
             logits = logits[:, -1, :] / temperature
             
             # Apply top-k filtering
             if top_k > 0:
-                # Ensure k does not exceed vocabulary size
                 k = min(top_k, logits.size(-1))
                 topk_values = torch.topk(logits, k)[0]
                 indices_to_remove = logits < topk_values[..., -1, None]

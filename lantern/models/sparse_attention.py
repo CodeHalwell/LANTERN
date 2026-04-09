@@ -166,6 +166,9 @@ class SparseAttention(nn.Module):
         
         # Softmax and dropout
         attn_probs = F.softmax(attn_weights, dim=-1)
+        # Defensive: if an entire row is masked (-inf), softmax produces NaN.
+        # Replace NaN with 0 to prevent silent corruption.
+        attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
         attn_probs = self.dropout(attn_probs)
         
         # Apply attention to values

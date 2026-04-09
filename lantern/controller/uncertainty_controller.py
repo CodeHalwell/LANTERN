@@ -1,8 +1,12 @@
 """
 Uncertainty Controller for LANTERN.
 
-Combines multiple uncertainty signals (entropy, semantic dispersion,
-epistemic variance) into a composite score for decision making.
+v3-final: Simplified 2-term composite uncertainty with adaptive EMA thresholds.
+
+U = α · σ² + λ · U_epistemic
+
+Thresholds self-calibrate via exponential moving averages of the running
+uncertainty distribution, using Z-scores for percentile-based routing.
 """
 
 from dataclasses import dataclass
@@ -11,7 +15,6 @@ from typing import List, Optional, Union
 
 import torch
 
-from lantern.uncertainty.entropy import compute_entropy, compute_p_max
 from lantern.uncertainty.semantic_dispersion import compute_semantic_dispersion
 
 
@@ -23,76 +26,148 @@ class UncertaintyLevel(Enum):
     VERY_HIGH = "very_high"
 
 
+# Routing actions mapped from uncertainty levels
+ROUTING_ACTIONS = {
+    UncertaintyLevel.CONFIDENT: "confident",
+    UncertaintyLevel.MODERATE: "moderate",
+    UncertaintyLevel.HIGH: "refine",
+    UncertaintyLevel.VERY_HIGH: "reason",
+}
+
+
 @dataclass
 class UncertaintyResult:
     """Result of uncertainty computation."""
-    entropy: torch.Tensor
-    p_max: torch.Tensor
-    semantic_dispersion: Optional[torch.Tensor]
-    composite_score: torch.Tensor
+    entropy: Optional[torch.Tensor] = None
+    p_max: Optional[torch.Tensor] = None
+    semantic_dispersion: Optional[torch.Tensor] = None
+    composite_score: Optional[torch.Tensor] = None
     epistemic_uncertainty: Optional[torch.Tensor] = None
     total_score: Optional[torch.Tensor] = None
     level: Optional[Union[UncertaintyLevel, List[UncertaintyLevel]]] = None
+    action: Optional[str] = None
 
 
 class UncertaintyController:
     """
     Controller for computing and acting on uncertainty estimates.
     
-    Combines:
-    - Entropy (distribution flatness)
-    - Max probability (confidence in top choice)
-    - Semantic dispersion (embedding space variance)
-    - Epistemic uncertainty (MC dropout variance)
-    
-    Into a composite score that triggers different behaviors:
-    - Low uncertainty: normal sampling
-    - Moderate uncertainty: refined sampling
-    - High uncertainty: reasoning mode (THINK token)
+    v3-final design:
+    - 2-term composite: U = α·σ² + λ·U_epistemic
+    - Adaptive thresholds via EMA of running uncertainty distribution
+    - 4 routing actions: confident, moderate, refine, reason
+    - Safe variance for single-element tensors
     """
     
     def __init__(
         self,
-        # Composite uncertainty weights
-        entropy_weight: float = 1.0,
-        dispersion_weight: float = 0.5,
-        p_max_weight: float = -0.5,  # Negative because high p_max = low uncertainty
-        epistemic_weight: float = 0.3,
+        # v3-final composite weights
+        dispersion_weight: float = 0.6,   # α
+        epistemic_weight: float = 0.4,    # λ
         
-        # Thresholds for triggering behaviors
-        tau_low: float = 1.0,      # Below this: confident
-        tau_mid: float = 2.0,      # Below this: moderate
-        tau_high: float = 3.0,     # Above this: very high uncertainty
+        # EMA decay for adaptive thresholds
+        ema_decay: float = 0.99,          # γ
+        
+        # Legacy static thresholds (used as fallback before EMA warms up)
+        tau_low: float = 1.0,
+        tau_mid: float = 2.0,
+        tau_high: float = 3.0,
+        
+        # Legacy weights (kept for backward compatibility)
+        entropy_weight: float = 1.0,
+        p_max_weight: float = -0.5,
         
         # Settings
         temperature: float = 1.0,
         top_k_dispersion: int = 10,
     ):
-        """
-        Initialize uncertainty controller.
-        
-        Args:
-            entropy_weight: Weight for entropy in composite score.
-            dispersion_weight: Weight for semantic dispersion.
-            p_max_weight: Weight for max probability (typically negative).
-            epistemic_weight: Weight for epistemic uncertainty.
-            tau_low: Threshold for confident classification.
-            tau_mid: Threshold for moderate uncertainty.
-            tau_high: Threshold for very high uncertainty.
-            temperature: Temperature for softmax.
-            top_k_dispersion: k for semantic dispersion calculation.
-        """
-        self.entropy_weight = entropy_weight
         self.dispersion_weight = dispersion_weight
-        self.p_max_weight = p_max_weight
         self.epistemic_weight = epistemic_weight
+        self.ema_decay = ema_decay
         
+        # Legacy weights
+        self.entropy_weight = entropy_weight
+        self.p_max_weight = p_max_weight
+        
+        # Static thresholds (fallback)
         self.tau_low = tau_low
         self.tau_mid = tau_mid
         self.tau_high = tau_high
         
         self.temperature = temperature
         self.top_k_dispersion = top_k_dispersion
+        
+        # EMA running statistics
+        self._ema_mean: Optional[float] = None
+        self._ema_var: Optional[float] = None
+        self._ema_initialized = False
+    
+    def _update_ema(self, uncertainty_batch: torch.Tensor):
+        """
+        Update EMA statistics from a batch of uncertainty scores.
+        
+        Safe variance computation: for single-element tensors,
+        variance defaults to 0.0.
+        """
+        batch_mean = uncertainty_batch.mean().item()
+        
+        if uncertainty_batch.numel() > 1:
+            batch_var = uncertainty_batch.var(unbiased=False).item()
+        else:
+            batch_var = 0.0
+        
+        if not self._ema_initialized:
+            self._ema_mean = batch_mean
+            self._ema_var = batch_var
+            self._ema_initialized = True
+        else:
+            γ = self.ema_decay
+            self._ema_mean = γ * self._ema_mean + (1 - γ) * batch_mean
+            self._ema_var = γ * self._ema_var + (1 - γ) * batch_var
+    
+    def _get_adaptive_thresholds(self) -> tuple:
+        """
+        Derive thresholds from Z-scores of the running distribution.
+        
+        τ_low  = μ - 0.52σ  (≈30th percentile)
+        τ_mid  = μ + 0.52σ  (≈70th percentile)
+        τ_high = μ + 1.28σ  (≈90th percentile)
+        
+        Falls back to static thresholds if EMA not yet initialized.
+        """
+        if not self._ema_initialized:
+            return self.tau_low, self.tau_mid, self.tau_high
+        
+        σ = max(self._ema_var, 0.0) ** 0.5
+        σ = max(σ, 1e-6)  # Prevent division by zero
+        μ = self._ema_mean
+        
+        tau_low = μ - 0.52 * σ
+        tau_mid = μ + 0.52 * σ
+        tau_high = μ + 1.28 * σ
+        
+        return tau_low, tau_mid, tau_high
+    
+    def compute_composite_uncertainty(
+        self,
+        semantic_dispersion: Optional[torch.Tensor] = None,
+        epistemic_uncertainty: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute v3-final 2-term composite uncertainty.
+        
+        U = α · σ² + λ · U_epistemic
+        
+        Both signals are expected to be sigmoid-bounded [0, 1].
+        """
+        score = torch.tensor(0.0)
+        
+        if semantic_dispersion is not None:
+            score = score + self.dispersion_weight * semantic_dispersion
+        if epistemic_uncertainty is not None:
+            score = score + self.epistemic_weight * epistemic_uncertainty
+        
+        return score
     
     def compute_base_uncertainty(
         self,
@@ -100,34 +175,30 @@ class UncertaintyController:
         embedding_matrix: Optional[torch.Tensor] = None,
     ) -> UncertaintyResult:
         """
-        Compute base uncertainty without Bayesian sampling.
+        Compute base uncertainty without epistemic component.
         
-        Args:
-            logits: Raw model logits [batch, vocab_size] or [vocab_size].
-            embedding_matrix: Optional embedding matrix for semantic dispersion.
-            
-        Returns:
-            UncertaintyResult with computed metrics.
+        For backward compatibility, also computes entropy and p_max,
+        but the composite score uses the v3-final 2-term formula.
         """
-        # Core uncertainty metrics
+        from lantern.uncertainty.entropy import compute_entropy, compute_p_max
+        
+        # Legacy metrics (still useful for interpretation)
         entropy = compute_entropy(logits, self.temperature)
         p_max = compute_p_max(logits, self.temperature)
         
-        # Semantic dispersion if embeddings available
+        # Semantic dispersion
+        dispersion = None
         if embedding_matrix is not None:
             dispersion = compute_semantic_dispersion(
-                logits, 
-                embedding_matrix, 
+                logits, embedding_matrix,
                 k=self.top_k_dispersion,
                 temperature=self.temperature,
             )
-        else:
-            dispersion = None
         
-        # Composite score
-        composite = self.entropy_weight * entropy + self.p_max_weight * p_max
-        if dispersion is not None:
-            composite = composite + self.dispersion_weight * dispersion
+        # Composite score using v3-final formula
+        composite = self.compute_composite_uncertainty(
+            semantic_dispersion=dispersion,
+        )
         
         return UncertaintyResult(
             entropy=entropy,
@@ -136,34 +207,6 @@ class UncertaintyController:
             composite_score=composite,
         )
     
-    def classify_uncertainty(
-        self,
-        score: torch.Tensor,
-    ) -> UncertaintyLevel:
-        """
-        Classify uncertainty level based on composite score.
-        
-        Args:
-            score: Composite uncertainty score.
-            
-        Returns:
-            UncertaintyLevel classification.
-        """
-        # Handle batched scores by classifying each element
-        if score.dim() > 0:
-            return [self.classify_uncertainty(s) for s in score.reshape(-1)]
-
-        score_val = score.item()
-
-        if score_val < self.tau_low:
-            return UncertaintyLevel.CONFIDENT
-        elif score_val < self.tau_mid:
-            return UncertaintyLevel.MODERATE
-        elif score_val < self.tau_high:
-            return UncertaintyLevel.HIGH
-        else:
-            return UncertaintyLevel.VERY_HIGH
-    
     def compute_total_uncertainty(
         self,
         base_result: UncertaintyResult,
@@ -171,16 +214,17 @@ class UncertaintyController:
     ) -> UncertaintyResult:
         """
         Combine base uncertainty with epistemic uncertainty.
-        
-        Args:
-            base_result: Result from compute_base_uncertainty.
-            epistemic_uncertainty: Epistemic uncertainty from Bayesian sampling.
-            
-        Returns:
-            Updated UncertaintyResult with total score.
         """
-        total = base_result.composite_score + self.epistemic_weight * epistemic_uncertainty
+        total = self.compute_composite_uncertainty(
+            semantic_dispersion=base_result.semantic_dispersion,
+            epistemic_uncertainty=epistemic_uncertainty,
+        )
+        
+        # Update EMA with this score
+        self._update_ema(total if total.dim() > 0 else total.unsqueeze(0))
+        
         level = self.classify_uncertainty(total)
+        action = self._get_action(level)
         
         return UncertaintyResult(
             entropy=base_result.entropy,
@@ -190,59 +234,71 @@ class UncertaintyController:
             epistemic_uncertainty=epistemic_uncertainty,
             total_score=total,
             level=level,
+            action=action,
         )
+    
+    def classify_uncertainty(
+        self,
+        score: torch.Tensor,
+    ) -> Union[UncertaintyLevel, List[UncertaintyLevel]]:
+        """Classify uncertainty level based on adaptive thresholds."""
+        if score.dim() > 0:
+            return [self.classify_uncertainty(s) for s in score.reshape(-1)]
+        
+        tau_low, tau_mid, tau_high = self._get_adaptive_thresholds()
+        score_val = score.item()
+        
+        if score_val < tau_low:
+            return UncertaintyLevel.CONFIDENT
+        elif score_val < tau_mid:
+            return UncertaintyLevel.MODERATE
+        elif score_val < tau_high:
+            return UncertaintyLevel.HIGH
+        else:
+            return UncertaintyLevel.VERY_HIGH
+    
+    def _get_action(
+        self, level: Union[UncertaintyLevel, List[UncertaintyLevel]]
+    ) -> str:
+        """Map uncertainty level to routing action."""
+        if isinstance(level, list):
+            # Take the highest priority action
+            priority = {
+                UncertaintyLevel.CONFIDENT: 0,
+                UncertaintyLevel.MODERATE: 1,
+                UncertaintyLevel.HIGH: 2,
+                UncertaintyLevel.VERY_HIGH: 3,
+            }
+            level = max(level, key=lambda lev: priority[lev])
+        return ROUTING_ACTIONS[level]
     
     def should_trigger_reasoning(
         self,
         result: UncertaintyResult,
     ) -> bool:
-        """
-        Determine if reasoning mode (THINK token) should be triggered.
-        
-        Args:
-            result: UncertaintyResult from computation.
-            
-        Returns:
-            True if reasoning should be triggered.
-        """
+        """Determine if full reasoning mode should be triggered."""
         score = result.total_score if result.total_score is not None else result.composite_score
+        _, _, tau_high = self._get_adaptive_thresholds()
         if isinstance(score, torch.Tensor) and score.dim() > 0:
-            return bool((score >= self.tau_high).any())
-        return score.item() >= self.tau_high
+            return bool((score >= tau_high).any())
+        return score.item() >= tau_high
     
     def should_do_bayesian(
         self,
         result: UncertaintyResult,
     ) -> bool:
-        """
-        Determine if Bayesian refinement is needed.
-        
-        Only do expensive Bayesian sampling if base uncertainty is elevated.
-        
-        Args:
-            result: UncertaintyResult from base computation.
-            
-        Returns:
-            True if Bayesian sampling should be performed.
-        """
+        """Determine if Bayesian / epistemic refinement is needed."""
         score = result.composite_score
+        tau_low, _, _ = self._get_adaptive_thresholds()
         if isinstance(score, torch.Tensor) and score.dim() > 0:
-            return bool((score >= self.tau_low).any())
-        return score.item() >= self.tau_low
+            return bool((score >= tau_low).any())
+        return score.item() >= tau_low
     
     def interpret(
         self,
         result: UncertaintyResult,
     ) -> str:
-        """
-        Provide human-readable interpretation of uncertainty.
-        
-        Args:
-            result: UncertaintyResult from computation.
-            
-        Returns:
-            Interpretation string.
-        """
+        """Provide human-readable interpretation of uncertainty."""
         level = result.level or self.classify_uncertainty(result.composite_score)
 
         if isinstance(level, list):
@@ -252,19 +308,18 @@ class UncertaintyController:
                 UncertaintyLevel.HIGH: 2,
                 UncertaintyLevel.VERY_HIGH: 3,
             }
-            level = max(level, key=lambda l: priority[l])
+            level = max(level, key=lambda lev: priority[lev])
 
         interpretations = {
             UncertaintyLevel.CONFIDENT: "Model is confident. Normal sampling recommended.",
             UncertaintyLevel.MODERATE: "Moderate uncertainty. Consider refined sampling.",
-            UncertaintyLevel.HIGH: "High uncertainty. Bayesian refinement recommended.",
-            UncertaintyLevel.VERY_HIGH: "Very high uncertainty. Trigger reasoning mode (THINK token).",
+            UncertaintyLevel.HIGH: "High uncertainty. Latent pause refinement recommended.",
+            UncertaintyLevel.VERY_HIGH: "Very high uncertainty. Trigger full latent reasoning + deep recursion.",
         }
         
         base = interpretations[level]
         
-        # Add details about semantic dispersion
-        if result.semantic_dispersion is not None:
+        if result.semantic_dispersion is not None and result.entropy is not None:
             disp_val = result.semantic_dispersion.mean().item()
             entropy_val = result.entropy.mean().item()
             

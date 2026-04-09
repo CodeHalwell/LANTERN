@@ -35,7 +35,7 @@ class TestLANTERNModel:
         seq_len = 32
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         assert logits.shape == (batch_size, seq_len, config.vocab_size)
     
@@ -47,10 +47,10 @@ class TestLANTERNModel:
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
         # Test with base steps
-        logits1, _ = model(input_ids, steps_per_block=2)
+        logits1, _, _ = model(input_ids, steps_per_block=2)
         
         # Test with reasoning steps
-        logits2, _ = model(input_ids, steps_per_block=4)
+        logits2, _, _ = model(input_ids, steps_per_block=4)
         
         # Both should produce valid outputs
         assert logits1.shape == logits2.shape
@@ -63,7 +63,7 @@ class TestLANTERNModel:
         
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
-        logits, hidden_states = model(input_ids, return_hidden_states=True)
+        logits, hidden_states, _ = model(input_ids, return_hidden_states=True)
         
         assert hidden_states is not None
         assert hidden_states.shape == (1, 16, config.hidden_size)
@@ -149,7 +149,7 @@ class TestLANTERNModel:
         model = LANTERNModel(config)
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         assert logits.shape == (1, 16, config.vocab_size)
 
@@ -167,7 +167,7 @@ class TestTrainingComponents:
         labels = torch.randint(0, config.vocab_size, (2, 16))
         
         # Forward pass
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         # Compute loss
         loss = torch.nn.functional.cross_entropy(
@@ -232,7 +232,7 @@ class TestTrainingComponents:
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
         labels = torch.randint(0, config.vocab_size, (2, 16))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, config.vocab_size),
             labels.view(-1),

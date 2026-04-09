@@ -168,7 +168,7 @@ class TestRecursiveTransformerBlock:
         )
         
         x = torch.randn(batch_size, seq_len, hidden_size)
-        output, steps = block.recur(x, steps_max=4)
+        output, steps, _ = block.recur(x, steps_max=4)
         
         assert output.shape == (batch_size, seq_len, hidden_size)
         assert steps == 4
@@ -190,8 +190,8 @@ class TestRecursiveTransformerBlock:
         x = torch.randn(batch_size, seq_len, hidden_size)
         
         with torch.no_grad():
-            output2, _ = block.recur(x.clone(), steps_max=2)
-            output4, _ = block.recur(x.clone(), steps_max=4)
+            output2, _, _ = block.recur(x.clone(), steps_max=2)
+            output4, _, _ = block.recur(x.clone(), steps_max=4)
         
         # Different depths should produce different outputs
         assert not torch.allclose(output2, output4)
@@ -223,7 +223,7 @@ class TestRecursiveTransformerStack:
         )
         
         x = torch.randn(batch_size, seq_len, hidden_size)
-        output, total_steps = stack(x, steps_per_block=2)
+        output, total_steps, _ = stack(x, steps_per_block=2)
         
         assert output.shape == (batch_size, seq_len, hidden_size)
         assert total_steps == 4  # 2 blocks * 2 steps each

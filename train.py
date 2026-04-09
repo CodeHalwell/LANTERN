@@ -257,7 +257,7 @@ class Trainer:
         labels = batch['labels'].to(self.device)
         
         # Forward pass
-        logits, _ = self.model(input_ids)
+        logits, _, _ = self.model(input_ids)
         
         # Compute cross-entropy loss
         # Reshape logits and labels for loss computation

@@ -107,7 +107,10 @@ class TestUncertaintyController:
     
     def test_compute_total_uncertainty(self):
         """Test combining base and epistemic uncertainty."""
-        controller = UncertaintyController(epistemic_weight=0.5)
+        controller = UncertaintyController(
+            dispersion_weight=0.6,
+            epistemic_weight=0.5,
+        )
         
         base_result = UncertaintyResult(
             entropy=torch.tensor(1.0),
@@ -119,7 +122,8 @@ class TestUncertaintyController:
         
         total_result = controller.compute_total_uncertainty(base_result, epistemic)
         
-        expected = 1.0 + 0.5 * 2.0  # base + weight * epistemic
+        # v3-final: U = α·σ² + λ·U_epistemic = 0.6*0.3 + 0.5*2.0 = 1.18
+        expected = 0.6 * 0.3 + 0.5 * 2.0
         assert torch.isclose(total_result.total_score, torch.tensor(expected))
         assert total_result.level is not None
     

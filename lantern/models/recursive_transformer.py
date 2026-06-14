@@ -73,11 +73,12 @@ class RecursiveTransformerBlock(nn.Module):
         dropout: float = 0.1,
         use_halting: bool = False,
         use_rope: bool = True,
+        global_token_indices=None,
         layer_norm_eps: float = 1e-6,
     ):
         """
         Initialize recursive transformer block.
-        
+
         Args:
             hidden_size: Dimension of hidden states.
             num_heads: Number of attention heads.
@@ -86,18 +87,20 @@ class RecursiveTransformerBlock(nn.Module):
             dropout: Dropout probability.
             use_halting: Whether to use adaptive halting mechanism.
             use_rope: Whether to use Rotary Position Embeddings.
+            global_token_indices: Set of global token indices for attention.
             layer_norm_eps: Epsilon for layer normalization.
         """
         super().__init__()
-        
+
         self.hidden_size = hidden_size
         self.use_halting = use_halting
-        
+
         # Attention with sparse pattern
         self.attention = SparseAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             window_size=window_size,
+            global_token_indices=global_token_indices,
             dropout=dropout,
             use_rope=use_rope,
         )
@@ -164,40 +167,70 @@ class RecursiveTransformerBlock(nn.Module):
     ) -> Tuple[torch.Tensor, int]:
         """
         Recursive application of the block.
-        
-        Applies the same block multiple times (weight sharing),
-        optionally with adaptive halting based on learned probabilities.
-        
+
+        Applies the same block multiple times (weight sharing). When
+        ``use_adaptive_halting`` is True and a halting head is present, this
+        implements a differentiable PonderNet/ACT-style mechanism: at each step
+        the halting head produces a per-token halting probability, and the final
+        output is a halting-probability-weighted combination of the per-step
+        hidden states. Because the output mixes states with weights that depend
+        on the halting head, gradients flow into the halting head through the
+        downstream loss (no non-differentiable early ``break``).
+
+        The expected ponder cost (expected number of steps) is recorded on
+        ``self._last_ponder_cost`` so callers can add it as a regularizer.
+
+        When ``use_adaptive_halting`` is False (or no halting head exists) the
+        behavior is identical to plain fixed-depth recursion.
+
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_size].
             steps_max: Maximum number of recursion steps.
             attention_mask: Optional attention mask.
             use_adaptive_halting: Whether to use learned halting.
-            halting_eps: Threshold for halting (1 - eps).
-            
+            halting_eps: Unused tolerance kept for backward compatibility.
+
         Returns:
-            Tuple of (output hidden states, actual number of steps taken).
+            Tuple of (output hidden states, number of steps taken).
         """
         batch_size, seq_len, _ = hidden_states.shape
-        
-        # Cumulative halting probability per token
-        cum_halt = torch.zeros(batch_size, seq_len, device=hidden_states.device)
-        
-        actual_steps = 0
+        device = hidden_states.device
+
+        adaptive = use_adaptive_halting and self.halting_head is not None
+
+        if not adaptive:
+            # Plain fixed-depth recursion (identical to original behavior).
+            for _ in range(steps_max):
+                hidden_states, _ = self.forward(hidden_states, attention_mask)
+            self._last_ponder_cost = torch.zeros((), device=device)
+            return hidden_states, steps_max
+
+        # --- Differentiable PonderNet/ACT-style halting ---
+        # remainder: probability mass not yet allocated, per token [B, L].
+        remainder = torch.ones(batch_size, seq_len, device=device)
+        weighted_output = torch.zeros_like(hidden_states)
+        # Expected number of steps accumulator, per token [B, L].
+        expected_steps = torch.zeros(batch_size, seq_len, device=device)
+
         for t in range(steps_max):
             hidden_states, p_halt = self.forward(hidden_states, attention_mask)
-            actual_steps += 1
-            
-            # Check for adaptive halting
-            if use_adaptive_halting and p_halt is not None:
-                # Compute the effective halting probability for this step (proper ACT)
-                step_halt = torch.minimum(p_halt, 1.0 - cum_halt)
-                cum_halt = cum_halt + step_halt
-                done = (cum_halt >= 1 - halting_eps).all()
-                if done:
-                    break
-        
-        return hidden_states, actual_steps
+
+            if t == steps_max - 1:
+                # Last step takes all remaining mass so weights sum to 1.
+                step_weight = remainder
+            else:
+                step_weight = remainder * p_halt
+
+            # Accumulate halting-probability-weighted hidden state.
+            weighted_output = weighted_output + step_weight.unsqueeze(-1) * hidden_states
+            # Expected steps: sum over steps of weight * (step index + 1).
+            expected_steps = expected_steps + step_weight * (t + 1)
+            # Reduce remaining probability mass.
+            remainder = remainder * (1.0 - p_halt)
+
+        # Mean expected number of steps across tokens/batch (scalar tensor).
+        self._last_ponder_cost = expected_steps.mean()
+        return weighted_output, steps_max
 
 
 class RecursiveTransformerStack(nn.Module):
@@ -217,9 +250,15 @@ class RecursiveTransformerStack(nn.Module):
         window_size: int = 256,
         dropout: float = 0.1,
         use_halting: bool = False,
+        use_rope: bool = True,
+        global_token_indices=None,
     ):
         super().__init__()
-        
+
+        # Track the last expected ponder cost (mean expected steps) so callers
+        # can retrieve it after a forward pass. Defaults to a zero scalar.
+        self._last_ponder_cost = None
+
         self.blocks = nn.ModuleList([
             RecursiveTransformerBlock(
                 hidden_size=hidden_size,
@@ -228,6 +267,8 @@ class RecursiveTransformerStack(nn.Module):
                 window_size=window_size,
                 dropout=dropout,
                 use_halting=use_halting,
+                use_rope=use_rope,
+                global_token_indices=global_token_indices,
             )
             for _ in range(num_blocks)
         ])
@@ -241,11 +282,18 @@ class RecursiveTransformerStack(nn.Module):
     ) -> Tuple[torch.Tensor, int]:
         """
         Forward pass through all blocks with recursion.
-        
+
+        When ``use_adaptive_halting`` is True, the expected ponder cost (mean
+        expected number of steps) is accumulated across blocks and stored on
+        ``self._last_ponder_cost`` as a scalar tensor. Otherwise it is set to a
+        zero scalar tensor.
+
         Returns:
             Tuple of (output, total steps taken across all blocks).
         """
+        device = hidden_states.device
         total_steps = 0
+        ponder_cost = torch.zeros((), device=device)
         for block in self.blocks:
             hidden_states, steps = block.recur(
                 hidden_states,
@@ -254,5 +302,9 @@ class RecursiveTransformerStack(nn.Module):
                 use_adaptive_halting=use_adaptive_halting,
             )
             total_steps += steps
-        
+            block_cost = getattr(block, "_last_ponder_cost", None)
+            if block_cost is not None:
+                ponder_cost = ponder_cost + block_cost
+
+        self._last_ponder_cost = ponder_cost
         return hidden_states, total_steps

@@ -56,7 +56,12 @@ class LANTERNModel(nn.Module):
             window_size=config.window_size,
             dropout=config.dropout,
             use_halting=config.use_adaptive_halting,
+            use_rope=config.use_rope,
+            global_token_indices=config.global_token_indices,
         )
+
+        # Most-recent expected ponder cost (mean expected steps) as a scalar.
+        self._last_ponder_cost = torch.zeros(())
         
         # Final layer norm
         self.ln_f = nn.LayerNorm(config.hidden_size)
@@ -132,7 +137,14 @@ class LANTERNModel(nn.Module):
             attention_mask=attention_mask,
             use_adaptive_halting=use_adaptive_halting,
         )
-        
+
+        # Record expected ponder cost from this forward pass. The stack stores
+        # a scalar tensor (zero when adaptive halting was not used).
+        stack_cost = getattr(self.transformer, "_last_ponder_cost", None)
+        if stack_cost is None:
+            stack_cost = torch.zeros((), device=device)
+        self._last_ponder_cost = stack_cost
+
         # Final layer norm
         hidden_states = self.ln_f(hidden_states)
         
@@ -143,6 +155,25 @@ class LANTERNModel(nn.Module):
             return logits, hidden_states
         return logits, None
     
+    def get_last_ponder_cost(self) -> torch.Tensor:
+        """
+        Get the expected ponder cost from the most recent forward pass.
+
+        Returns the mean expected number of recursion steps (summed across
+        blocks) computed by the differentiable halting mechanism on the last
+        call to ``forward``. If adaptive halting was not used, this is a zero
+        scalar tensor. The returned value is differentiable with respect to the
+        halting-head parameters so it can be used directly as a ponder-cost
+        regularizer in the training loss.
+
+        Returns:
+            Scalar tensor with the mean expected number of steps.
+        """
+        cost = getattr(self, "_last_ponder_cost", None)
+        if cost is None:
+            return torch.zeros(())
+        return cost
+
     def get_embedding_matrix(self) -> torch.Tensor:
         """
         Get the embedding matrix for uncertainty estimation.

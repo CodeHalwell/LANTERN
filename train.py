@@ -20,15 +20,22 @@ from torch.utils.data import Dataset, DataLoader
 
 from lantern.models.lantern_model import LANTERNModel
 from lantern.utils.config import create_small_config, create_base_config
+from lantern.utils.tokenizer import CharTokenizer
 
 
 class TextDataset(Dataset):
     """
     Simple text dataset for language modeling.
-    
+
     Loads text data and creates training sequences of a fixed length.
+
+    When a real text file is provided, a ``CharTokenizer`` is built from the
+    file contents and exposed via the ``.tokenizer`` attribute (and the dataset
+    ``vocab_size`` reflects the tokenizer's true vocabulary size). When no file
+    is found, synthetic random token ids are generated using the provided
+    ``vocab_size`` and ``.tokenizer`` is ``None``.
     """
-    
+
     def __init__(
         self,
         data_path: str,
@@ -37,35 +44,40 @@ class TextDataset(Dataset):
     ):
         """
         Initialize text dataset.
-        
+
         Args:
             data_path: Path to text file or tokenized data.
             seq_length: Sequence length for training.
-            vocab_size: Size of vocabulary.
+            vocab_size: Size of vocabulary (used only for synthetic fallback).
         """
         self.seq_length = seq_length
         self.vocab_size = vocab_size
-        
+        self.tokenizer: Optional[CharTokenizer] = None
+
         # Load data
         if os.path.exists(data_path):
             with open(data_path, 'r', encoding='utf-8') as f:
                 text = f.read()
-            
-            # Simple character-level tokenization for demonstration
-            # In practice, use a proper tokenizer like BPE or SentencePiece
-            chars = sorted(list(set(text)))
-            self.char_to_idx = {ch: i for i, ch in enumerate(chars)}
-            self.idx_to_char = {i: ch for i, ch in enumerate(chars)}
-            
+
+            # Build a proper, persistable character-level tokenizer.
+            # Include an 'unknown' special token so generation prompts with
+            # unseen characters do not crash at inference time.
+            self.tokenizer = CharTokenizer.from_text(
+                text, special_tokens=["unknown"]
+            )
+            self.vocab_size = self.tokenizer.vocab_size
+
             # Convert text to token IDs
-            self.data = torch.tensor([self.char_to_idx[ch] for ch in text], dtype=torch.long)
-            print(f"Loaded {len(text)} characters, {len(chars)} unique.")
+            self.data = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+            print(
+                f"Loaded {len(text)} characters; "
+                f"tokenizer vocab size {self.tokenizer.vocab_size}."
+            )
         else:
             # Generate synthetic data for testing
             print(f"Data file not found at {data_path}. Using synthetic data.")
             self.data = torch.randint(0, vocab_size, (100000,), dtype=torch.long)
-            self.char_to_idx = None
-            self.idx_to_char = None
+            self.tokenizer = None
     
     def __len__(self) -> int:
         """Return number of sequences in dataset."""
@@ -122,10 +134,13 @@ class Trainer:
         grad_clip: float = 1.0,
         num_workers: int = 0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        tokenizer: Optional[CharTokenizer] = None,
+        use_adaptive_halting: bool = False,
+        ponder_weight: float = 0.0,
     ):
         """
         Initialize trainer.
-        
+
         Args:
             model: LANTERN model to train.
             train_dataset: Training dataset.
@@ -141,13 +156,19 @@ class Trainer:
             grad_clip: Gradient clipping threshold.
             num_workers: Number of data loading workers (0 for single-threaded).
             device: Device to train on.
+            tokenizer: Optional CharTokenizer to persist with checkpoints.
+            use_adaptive_halting: If True, call the model with adaptive halting
+                enabled and (optionally) add the ponder cost to the loss.
+            ponder_weight: Weight applied to the model's ponder cost (only used
+                when ``use_adaptive_halting`` is True and the model exposes
+                ``get_last_ponder_cost``).
         """
         self.model = model.to(device)
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.batch_size = batch_size
         self.max_steps = max_steps
         self.eval_interval = eval_interval
@@ -155,6 +176,16 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.grad_clip = grad_clip
         self.device = device
+        self.tokenizer = tokenizer
+        self.use_adaptive_halting = use_adaptive_halting
+        self.ponder_weight = ponder_weight
+
+        # Persist the tokenizer alongside checkpoints so that generation can
+        # decode model outputs back into readable text.
+        self.tokenizer_path = self.output_dir / "tokenizer.json"
+        if self.tokenizer is not None:
+            self.tokenizer.save(str(self.tokenizer_path))
+            print(f"Tokenizer saved to {self.tokenizer_path}")
         
         # Create data loaders
         self.train_loader = DataLoader(
@@ -211,7 +242,13 @@ class Trainer:
             'best_val_loss': self.best_val_loss,
             'config': asdict(self.model.config),
         }
-        
+
+        # Store tokenizer info so generate.py can decode model outputs. We embed
+        # the serialized dict directly and also record the on-disk path.
+        if self.tokenizer is not None:
+            checkpoint['tokenizer'] = self.tokenizer.to_dict()
+            checkpoint['tokenizer_path'] = str(self.tokenizer_path)
+
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
     
@@ -255,10 +292,13 @@ class Trainer:
         """
         input_ids = batch['input_ids'].to(self.device)
         labels = batch['labels'].to(self.device)
-        
-        # Forward pass
-        logits, _ = self.model(input_ids)
-        
+
+        # Forward pass. When adaptive halting is enabled, request it explicitly.
+        if self.use_adaptive_halting:
+            logits, _ = self.model(input_ids, use_adaptive_halting=True)
+        else:
+            logits, _ = self.model(input_ids)
+
         # Compute cross-entropy loss
         # Reshape logits and labels for loss computation
         loss = F.cross_entropy(
@@ -266,7 +306,19 @@ class Trainer:
             labels.view(-1),
             reduction='mean',
         )
-        
+
+        # Optionally add a ponder (halting) cost regularizer. Guarded with
+        # hasattr so this works even if the model does not (yet) implement
+        # get_last_ponder_cost (it may be added by another component).
+        if (
+            self.use_adaptive_halting
+            and self.ponder_weight > 0
+            and hasattr(self.model, 'get_last_ponder_cost')
+        ):
+            ponder_cost = self.model.get_last_ponder_cost()
+            if ponder_cost is not None:
+                loss = loss + self.ponder_weight * ponder_cost
+
         return loss
     
     @torch.no_grad()
@@ -520,7 +572,19 @@ def main():
         default=None,
         help="Path to checkpoint to resume from",
     )
-    
+    parser.add_argument(
+        "--use_adaptive_halting",
+        action="store_true",
+        help="Enable adaptive (learned) halting in the recursive stack",
+    )
+    parser.add_argument(
+        "--ponder_weight",
+        type=float,
+        default=0.0,
+        help="Weight for the ponder/halting cost regularizer (requires "
+             "--use_adaptive_halting and model.get_last_ponder_cost)",
+    )
+
     args = parser.parse_args()
     
     # Create config
@@ -537,7 +601,9 @@ def main():
         config.num_heads = args.num_heads
     if args.num_blocks is not None:
         config.num_blocks = args.num_blocks
-    
+    if args.use_adaptive_halting:
+        config.use_adaptive_halting = True
+
     # Create datasets
     print("Loading datasets...")
     train_dataset = TextDataset(
@@ -545,7 +611,20 @@ def main():
         seq_length=args.seq_length,
         vocab_size=config.vocab_size,
     )
-    
+
+    # When training on a real text file, the dataset builds a CharTokenizer and
+    # the model's vocab_size must match the tokenizer's true vocab size (rather
+    # than the 32000 default, which would leave most embedding rows dead).
+    if train_dataset.tokenizer is not None:
+        config.vocab_size = train_dataset.tokenizer.vocab_size
+        # Wire up special-token ids on the config so the model/generation can
+        # reference them consistently.
+        config.unknown_token_id = train_dataset.tokenizer.unknown_token_id
+        config.think_token_id = train_dataset.tokenizer.think_token_id
+        config.eos_token_id = train_dataset.tokenizer.eos_token_id
+        config.pad_token_id = train_dataset.tokenizer.pad_token_id
+        print(f"Set model vocab_size to {config.vocab_size} from tokenizer.")
+
     val_dataset = None
     if args.val_data_path is not None:
         val_dataset = TextDataset(
@@ -553,7 +632,7 @@ def main():
             seq_length=args.seq_length,
             vocab_size=config.vocab_size,
         )
-    
+
     # Create model
     print("Creating model...")
     model = LANTERNModel(config)
@@ -582,8 +661,11 @@ def main():
         grad_clip=args.grad_clip,
         num_workers=args.num_workers,
         device=args.device,
+        tokenizer=train_dataset.tokenizer,
+        use_adaptive_halting=args.use_adaptive_halting,
+        ponder_weight=args.ponder_weight,
     )
-    
+
     # Resume from checkpoint if specified
     if args.resume_from is not None:
         trainer.load_checkpoint(args.resume_from)

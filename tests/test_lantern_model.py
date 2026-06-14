@@ -154,6 +154,74 @@ class TestLANTERNModel:
         assert logits.shape == (1, 16, config.vocab_size)
 
 
+class TestPonderCostAndHalting:
+    """Tests for differentiable halting wired through the full model."""
+
+    def test_get_last_ponder_cost_zero_without_halting(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 16))
+        model(input_ids, use_adaptive_halting=False)
+
+        cost = model.get_last_ponder_cost()
+        assert isinstance(cost, torch.Tensor)
+        assert cost.dim() == 0
+        assert cost.item() == 0.0
+
+    def test_get_last_ponder_cost_positive_with_halting(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.use_adaptive_halting = True
+        model = LANTERNModel(config)
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 16))
+        model(input_ids, steps_per_block=4, use_adaptive_halting=True)
+
+        cost = model.get_last_ponder_cost()
+        assert cost.dim() == 0
+        assert cost.item() > 0.0
+
+    def test_halting_head_gradient_through_model(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.use_adaptive_halting = True
+        model = LANTERNModel(config)
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 16))
+        labels = torch.randint(0, config.vocab_size, (2, 16))
+
+        logits, _ = model(input_ids, steps_per_block=4, use_adaptive_halting=True)
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, config.vocab_size), labels.view(-1)
+        )
+        loss.backward()
+
+        # At least one halting head must have received a nonzero gradient.
+        got_grad = False
+        for block in model.transformer.blocks:
+            assert block.halting_head is not None
+            grad = block.halting_head.linear.weight.grad
+            if grad is not None and grad.abs().sum().item() > 0:
+                got_grad = True
+        assert got_grad, "halting head received no gradient through the model"
+
+    def test_use_rope_false_config_propagates(self):
+        config = create_small_config()
+        config.use_rope = False
+        model = LANTERNModel(config)
+        for block in model.transformer.blocks:
+            assert block.attention.use_rope is False
+
+    def test_global_token_indices_config_propagates(self):
+        config = create_small_config()
+        config.global_token_indices = {0, 2, 5}
+        model = LANTERNModel(config)
+        for block in model.transformer.blocks:
+            assert block.attention.global_token_indices == {0, 2, 5}
+
+
 class TestTrainingComponents:
     """Tests for training-related functionality."""
     

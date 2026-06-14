@@ -18,6 +18,7 @@ from lantern.uncertainty.semantic_dispersion import compute_semantic_dispersion
 from lantern.uncertainty.bayesian import BayesianSampler
 from lantern.controller.uncertainty_controller import UncertaintyController
 from lantern.controller.generation import GenerationController
+from lantern.utils.tokenizer import CharTokenizer
 
 __all__ = [
     "RecursiveTransformerBlock",
@@ -29,4 +30,5 @@ __all__ = [
     "BayesianSampler",
     "UncertaintyController",
     "GenerationController",
+    "CharTokenizer",
 ]

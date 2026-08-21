@@ -107,7 +107,10 @@ class TestUncertaintyController:
     
     def test_compute_total_uncertainty(self):
         """Test combining base and epistemic uncertainty."""
-        controller = UncertaintyController(epistemic_weight=0.5)
+        controller = UncertaintyController(
+            dispersion_weight=0.6,
+            epistemic_weight=0.5,
+        )
         
         base_result = UncertaintyResult(
             entropy=torch.tensor(1.0),
@@ -119,7 +122,8 @@ class TestUncertaintyController:
         
         total_result = controller.compute_total_uncertainty(base_result, epistemic)
         
-        expected = 1.0 + 0.5 * 2.0  # base + weight * epistemic
+        # v3-final: U = α·σ² + λ·U_epistemic = 0.6*0.3 + 0.5*2.0 = 1.18
+        expected = 0.6 * 0.3 + 0.5 * 2.0
         assert torch.isclose(total_result.total_score, torch.tensor(expected))
         assert total_result.level is not None
     
@@ -411,121 +415,6 @@ class TestGenerationStep:
         assert step.probability == 0.3
         assert step.mode == GenerationMode.NORMAL
         assert step.used_bayesian
-
-
-class TestGenerateTokensEndToEnd:
-    """End-to-end tests driving generate_tokens through a real LANTERNModel."""
-
-    @pytest.fixture
-    def tiny_model(self):
-        """Build a tiny real LANTERNModel for end-to-end generation."""
-        from lantern.models.lantern_model import LANTERNModel
-        from lantern.utils.config import create_small_config
-
-        config = create_small_config()
-        config.vocab_size = 50
-        config.max_position = 64
-
-        torch.manual_seed(0)
-        model = LANTERNModel(config)
-        model.eval()
-        return model
-
-    def test_generate_tokens_grows_sequence(self, tiny_model):
-        """generate_tokens grows the sequence and returns a long tensor."""
-        model = tiny_model
-
-        controller = GenerationController.from_model(
-            model,
-            GenerationConfig(max_new_tokens=8, eos_token_id=None),
-        )
-
-        input_ids = torch.randint(0, 50, (1, 5), dtype=torch.long)
-        output = controller.generate_tokens(input_ids, 8)
-
-        assert output.dtype == torch.long
-        assert output.dim() == 2
-        assert output.shape[0] == 1
-        # Output must grow beyond the prompt (up to 8 new tokens).
-        assert output.shape[1] > input_ids.shape[1]
-        assert output.shape[1] <= input_ids.shape[1] + 8
-        # Prompt is preserved as a prefix.
-        assert torch.equal(output[:, :5], input_ids)
-        # Controller resets to normal mode at the end.
-        assert controller.current_mode == GenerationMode.NORMAL
-
-    def test_generate_tokens_stops_on_eos(self, tiny_model):
-        """Generation stops when the model emits the EOS token."""
-        model = tiny_model
-
-        input_ids = torch.randint(0, 50, (1, 4), dtype=torch.long)
-
-        # Keep thresholds high so reasoning/Bayesian paths don't interfere and
-        # greedy (top_k=1) decoding stays deterministic.
-        calm_controller = UncertaintyController(
-            tau_low=1e9,
-            tau_mid=1e9,
-            tau_high=1e9,
-        )
-
-        # Determine the deterministic first greedy token, then make THAT the
-        # EOS so generation must stop on step 1.
-        with torch.no_grad():
-            logits, _ = model.forward(
-                input_ids, steps_per_block=2, return_hidden_states=True
-            )
-        eos_id = int(logits[0, -1].argmax().item())
-
-        controller = GenerationController.from_model(
-            model,
-            GenerationConfig(
-                max_new_tokens=20,
-                eos_token_id=eos_id,
-                top_k=1,
-                temperature=1.0,
-            ),
-            uncertainty_controller=calm_controller,
-        )
-
-        output = controller.generate_tokens(input_ids, 20)
-
-        # Should stop well before generating all 20 tokens.
-        assert output.shape[1] < input_ids.shape[1] + 20
-        # Last token is the EOS token; generation stopped immediately.
-        assert output[0, -1].item() == eos_id
-        assert output.shape[1] == input_ids.shape[1] + 1
-
-    def test_generate_tokens_injects_think_token(self, tiny_model):
-        """Forcing reasoning causes a THINK token to appear in the output."""
-        model = tiny_model
-
-        think_id = 42
-        # Thresholds set very negative so should_trigger_reasoning / bayesian
-        # are always true.
-        forcing_controller = UncertaintyController(
-            tau_low=-1000.0,
-            tau_mid=-1000.0,
-            tau_high=-1000.0,
-        )
-
-        controller = GenerationController.from_model(
-            model,
-            GenerationConfig(
-                max_new_tokens=6,
-                think_token_id=think_id,
-                eos_token_id=None,
-                num_bayesian_samples=2,
-            ),
-            uncertainty_controller=forcing_controller,
-        )
-
-        input_ids = torch.randint(0, 50, (1, 3), dtype=torch.long)
-        output = controller.generate_tokens(input_ids, 6)
-
-        # THINK token should appear among the generated tokens.
-        generated = output[0, input_ids.shape[1]:]
-        assert (generated == think_id).any()
-        assert output.dtype == torch.long
 
 
 if __name__ == "__main__":

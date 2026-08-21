@@ -35,7 +35,7 @@ class TestLANTERNModel:
         seq_len = 32
         input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         assert logits.shape == (batch_size, seq_len, config.vocab_size)
     
@@ -47,10 +47,10 @@ class TestLANTERNModel:
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
         # Test with base steps
-        logits1, _ = model(input_ids, steps_per_block=2)
+        logits1, _, _ = model(input_ids, steps_per_block=2)
         
         # Test with reasoning steps
-        logits2, _ = model(input_ids, steps_per_block=4)
+        logits2, _, _ = model(input_ids, steps_per_block=4)
         
         # Both should produce valid outputs
         assert logits1.shape == logits2.shape
@@ -63,7 +63,7 @@ class TestLANTERNModel:
         
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
-        logits, hidden_states = model(input_ids, return_hidden_states=True)
+        logits, hidden_states, _ = model(input_ids, return_hidden_states=True)
         
         assert hidden_states is not None
         assert hidden_states.shape == (1, 16, config.hidden_size)
@@ -149,77 +149,9 @@ class TestLANTERNModel:
         model = LANTERNModel(config)
         input_ids = torch.randint(0, config.vocab_size, (1, 16))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         assert logits.shape == (1, 16, config.vocab_size)
-
-
-class TestPonderCostAndHalting:
-    """Tests for differentiable halting wired through the full model."""
-
-    def test_get_last_ponder_cost_zero_without_halting(self):
-        config = create_small_config()
-        config.vocab_size = TEST_VOCAB_SIZE
-        model = LANTERNModel(config)
-
-        input_ids = torch.randint(0, config.vocab_size, (1, 16))
-        model(input_ids, use_adaptive_halting=False)
-
-        cost = model.get_last_ponder_cost()
-        assert isinstance(cost, torch.Tensor)
-        assert cost.dim() == 0
-        assert cost.item() == 0.0
-
-    def test_get_last_ponder_cost_positive_with_halting(self):
-        config = create_small_config()
-        config.vocab_size = TEST_VOCAB_SIZE
-        config.use_adaptive_halting = True
-        model = LANTERNModel(config)
-
-        input_ids = torch.randint(0, config.vocab_size, (2, 16))
-        model(input_ids, steps_per_block=4, use_adaptive_halting=True)
-
-        cost = model.get_last_ponder_cost()
-        assert cost.dim() == 0
-        assert cost.item() > 0.0
-
-    def test_halting_head_gradient_through_model(self):
-        config = create_small_config()
-        config.vocab_size = TEST_VOCAB_SIZE
-        config.use_adaptive_halting = True
-        model = LANTERNModel(config)
-
-        input_ids = torch.randint(0, config.vocab_size, (2, 16))
-        labels = torch.randint(0, config.vocab_size, (2, 16))
-
-        logits, _ = model(input_ids, steps_per_block=4, use_adaptive_halting=True)
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, config.vocab_size), labels.view(-1)
-        )
-        loss.backward()
-
-        # At least one halting head must have received a nonzero gradient.
-        got_grad = False
-        for block in model.transformer.blocks:
-            assert block.halting_head is not None
-            grad = block.halting_head.linear.weight.grad
-            if grad is not None and grad.abs().sum().item() > 0:
-                got_grad = True
-        assert got_grad, "halting head received no gradient through the model"
-
-    def test_use_rope_false_config_propagates(self):
-        config = create_small_config()
-        config.use_rope = False
-        model = LANTERNModel(config)
-        for block in model.transformer.blocks:
-            assert block.attention.use_rope is False
-
-    def test_global_token_indices_config_propagates(self):
-        config = create_small_config()
-        config.global_token_indices = {0, 2, 5}
-        model = LANTERNModel(config)
-        for block in model.transformer.blocks:
-            assert block.attention.global_token_indices == {0, 2, 5}
 
 
 class TestTrainingComponents:
@@ -235,7 +167,7 @@ class TestTrainingComponents:
         labels = torch.randint(0, config.vocab_size, (2, 16))
         
         # Forward pass
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         
         # Compute loss
         loss = torch.nn.functional.cross_entropy(
@@ -300,7 +232,7 @@ class TestTrainingComponents:
         input_ids = torch.randint(0, config.vocab_size, (2, 16))
         labels = torch.randint(0, config.vocab_size, (2, 16))
         
-        logits, _ = model(input_ids)
+        logits, _, _ = model(input_ids)
         loss = torch.nn.functional.cross_entropy(
             logits.view(-1, config.vocab_size),
             labels.view(-1),

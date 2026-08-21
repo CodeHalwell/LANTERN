@@ -81,33 +81,6 @@ result = controller.compute_base_uncertainty(logits, embedding_matrix)
 print(f"Should trigger reasoning: {controller.should_trigger_reasoning(result)}")
 ```
 
-### End-to-end text generation
-
-Train a model (see [TRAINING.md](TRAINING.md)), then generate text. The `CharTokenizer`
-saved during training is loaded automatically and used to encode the prompt and decode
-the output. `GenerationController` runs a real autoregressive loop with uncertainty-aware
-THINK-token injection, adaptive recursion depth, and Bayesian refinement:
-
-```python
-import torch
-from lantern import CharTokenizer
-from lantern.models.lantern_model import LANTERNModel
-from lantern.controller.generation import GenerationController, GenerationConfig
-
-tokenizer = CharTokenizer.load("outputs/tokenizer.json")
-# ... load model from checkpoint (see TRAINING.md) ...
-
-controller = GenerationController.from_model(
-    model,
-    GenerationConfig(max_new_tokens=100, think_token_id=tokenizer.think_token_id),
-)
-input_ids = torch.tensor([tokenizer.encode("Once upon a time")])
-output_ids = controller.generate_tokens(input_ids, max_new_tokens=100)
-print(tokenizer.decode(output_ids[0].tolist()))
-```
-
-Or from the command line: `python generate.py --checkpoint <ckpt> --prompt "..." --use_uncertainty`.
-
 ## Architecture Overview
 
 ### 1. Recursive Sparse Transformer

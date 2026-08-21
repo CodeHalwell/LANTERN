@@ -52,7 +52,7 @@ The script will:
 2. Create sequences of length `--seq_length` (default: 512)
 3. Train the model to predict the next token in each sequence
 
-**Note**: The implementation uses character-level tokenization (`lantern.utils.CharTokenizer`) for simplicity. The tokenizer's vocabulary is built from your data, the model's `vocab_size` is set to match it automatically, and the tokenizer is **persisted** to `tokenizer.json` in the output directory (and embedded in each checkpoint) so `generate.py` can decode generated IDs back to readable text. For production use, swap in a proper subword tokenizer (BPE/SentencePiece) by replacing `CharTokenizer` in the `TextDataset` class.
+**Note**: The current implementation uses character-level tokenization for simplicity. For production use, replace this with a proper tokenizer like BPE or SentencePiece by modifying the `TextDataset` class.
 
 ## Configuration Options
 
@@ -75,8 +75,6 @@ The script will:
 - `--max_steps`: Maximum training steps (default: 10000)
 - `--warmup_steps`: Learning rate warmup steps (default: 100)
 - `--grad_clip`: Gradient clipping threshold (default: 1.0)
-- `--use_adaptive_halting`: Enable PonderNet/ACT-style adaptive recursion depth (the halting head learns when to stop recursing; it is trained end-to-end via a halting-probability-weighted output)
-- `--ponder_weight`: Weight for the optional ponder-cost regularizer (default: 0.0). When `> 0` and adaptive halting is enabled, `ponder_weight * model.get_last_ponder_cost()` is added to the loss to encourage fewer recursion steps
 
 ### Data Configuration
 
@@ -162,34 +160,40 @@ print(output)
 
 ## Advanced: Uncertainty-Aware Generation
 
-For uncertainty-aware generation with THINK tokens, adaptive recursion, and Bayesian
-refinement, use `GenerationController.from_model()` and `generate_tokens()`. This is a
-real, end-to-end autoregressive loop (the running sequence is re-embedded each step):
+For uncertainty-aware generation with THINK tokens and adaptive recursion:
 
 ```python
-import torch
-from lantern.controller.generation import GenerationController, GenerationConfig
+from lantern import GenerationController, UncertaintyController
+from lantern.controller.generation import GenerationConfig
 
+# Create uncertainty controller
+uncertainty_controller = UncertaintyController(
+    tau_low=1.0,
+    tau_mid=2.0,
+    tau_high=3.0,
+)
+
+# Create generation config with THINK token
 gen_config = GenerationConfig(
     max_new_tokens=100,
     temperature=0.8,
-    think_token_id=tokenizer.think_token_id,  # injected when uncertainty is very high
-    eos_token_id=tokenizer.eos_token_id,
+    think_token_id=50256,  # Your THINK token ID
+    eos_token_id=50257,    # Your EOS token ID
 )
 
-# from_model derives lm_head, embedding_matrix and the recursive forward from the model
-controller = GenerationController.from_model(model, gen_config)
+# Create generation controller
+controller = GenerationController(
+    model=model.transformer,
+    lm_head=model.lm_head,
+    embedding_matrix=model.get_embedding_matrix(),
+    uncertainty_controller=uncertainty_controller,
+    config=gen_config,
+    recur_fn=lambda h, steps_max: model.transformer(h, steps_per_block=steps_max),
+)
 
-input_ids = torch.tensor([tokenizer.encode("Once upon a time")])
-output_ids = controller.generate_tokens(input_ids, max_new_tokens=100)
-print(tokenizer.decode(output_ids[0].tolist()))
+# Generate with uncertainty awareness
+# Note: Requires proper hidden state management
 ```
-
-At each step the controller computes a composite uncertainty score, optionally runs
-MC-dropout Bayesian refinement when uncertainty is elevated, and switches to a deeper
-"reasoning" recursion depth (injecting the THINK token) when uncertainty exceeds
-`tau_high`. The easiest way to drive this from the command line is
-`python generate.py --checkpoint <ckpt> --prompt "..." --use_uncertainty`.
 
 ## Tips for Better Training
 

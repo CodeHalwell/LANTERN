@@ -70,31 +70,15 @@ python train.py \
 
 ### Basic Generation
 
-Generate text using a trained model. The tokenizer saved during training (embedded in
-the checkpoint, or `tokenizer.json` next to it) is loaded automatically, so the prompt is
-plain text and the output is decoded back to text:
+Generate text using a trained model:
 
 ```bash
 python generate.py \
     --checkpoint ./outputs/char_model/best_model.pt \
-    --prompt "To be, or not to be" \
+    --prompt "1,2,3,4,5" \
     --max_tokens 50 \
     --temperature 0.8
 ```
-
-For uncertainty-aware generation (THINK-token injection, adaptive recursion depth,
-Bayesian refinement):
-
-```bash
-python generate.py \
-    --checkpoint ./outputs/char_model/best_model.pt \
-    --prompt "To be, or not to be" \
-    --max_tokens 50 \
-    --use_uncertainty
-```
-
-You can point `--tokenizer ./outputs/char_model/tokenizer.json` explicitly if the
-checkpoint does not embed one.
 
 ### Custom Model Sizes
 
@@ -114,10 +98,10 @@ python train.py \
 
 ### Character-Level
 
-The training script uses `lantern.utils.CharTokenizer` by default:
-- Each unique character gets a token ID; the model's `vocab_size` is set to match
-- The tokenizer is saved (`tokenizer.json` and embedded in checkpoints) so generation can decode IDs back to text
-- Suitable for small datasets and testing; works out-of-the-box with any text file
+The training script includes simple character-level tokenization by default:
+- Each unique character gets a token ID
+- Suitable for small datasets and testing
+- Works out-of-the-box with any text file
 
 ### Token-Level (Recommended for Production)
 
@@ -238,20 +222,13 @@ tensorboard --logdir=./runs
 
 ### Uncertainty-Aware Generation
 
-After training, use the controller for adaptive, end-to-end generation:
+After training, use the uncertainty controller for adaptive generation:
 
 ```python
-import torch
-from lantern.controller.generation import GenerationController, GenerationConfig
+from lantern import GenerationController, UncertaintyController
 
-controller = GenerationController.from_model(
-    model,
-    GenerationConfig(max_new_tokens=100, think_token_id=tokenizer.think_token_id),
-)
-output_ids = controller.generate_tokens(
-    torch.tensor([tokenizer.encode("The")]), max_new_tokens=100
-)
-print(tokenizer.decode(output_ids[0].tolist()))
+# See generate.py for full example
+controller = GenerationController(...)
 ```
 
 ### Bayesian Refinement

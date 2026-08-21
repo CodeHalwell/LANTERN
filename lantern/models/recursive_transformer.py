@@ -3,6 +3,11 @@ Recursive Transformer Block for LANTERN.
 
 Implements a transformer block that can be recursively applied
 with weight sharing for depth-on-demand computation.
+
+v3-final features:
+- Step embeddings to prevent representation collapse
+- Differentiable ACT with ponder cost
+- Probability-weighted output averaging
 """
 
 from typing import Optional, Tuple
@@ -61,7 +66,8 @@ class RecursiveTransformerBlock(nn.Module):
     - Sparse multi-head self-attention
     - SwiGLU MLP
     - LayerNorm + residuals
-    - Optional halting mechanism for adaptive depth
+    - Learned step embeddings to prevent representation collapse
+    - Optional halting mechanism for adaptive depth with differentiable ponder cost
     """
     
     def __init__(
@@ -73,12 +79,12 @@ class RecursiveTransformerBlock(nn.Module):
         dropout: float = 0.1,
         use_halting: bool = False,
         use_rope: bool = True,
-        global_token_indices=None,
         layer_norm_eps: float = 1e-6,
+        max_steps: int = 8,
     ):
         """
         Initialize recursive transformer block.
-
+        
         Args:
             hidden_size: Dimension of hidden states.
             num_heads: Number of attention heads.
@@ -87,20 +93,24 @@ class RecursiveTransformerBlock(nn.Module):
             dropout: Dropout probability.
             use_halting: Whether to use adaptive halting mechanism.
             use_rope: Whether to use Rotary Position Embeddings.
-            global_token_indices: Set of global token indices for attention.
             layer_norm_eps: Epsilon for layer normalization.
+            max_steps: Maximum recursion steps (for step embeddings).
         """
         super().__init__()
-
+        
         self.hidden_size = hidden_size
         self.use_halting = use_halting
-
+        self.max_steps = max_steps
+        
+        # Step embeddings to prevent representation collapse during recursion.
+        # Analogous to positional embeddings but for recursion depth.
+        self.step_embeddings = nn.Embedding(max_steps, hidden_size)
+        
         # Attention with sparse pattern
         self.attention = SparseAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
             window_size=window_size,
-            global_token_indices=global_token_indices,
             dropout=dropout,
             use_rope=use_rope,
         )
@@ -125,6 +135,7 @@ class RecursiveTransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        step_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Single forward pass through the block.
@@ -132,10 +143,19 @@ class RecursiveTransformerBlock(nn.Module):
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_size].
             attention_mask: Optional attention mask.
+            step_index: Optional recursion step index for step embedding.
             
         Returns:
             Tuple of (output hidden states, halting probabilities if use_halting).
         """
+        # Add step embedding if step index is provided
+        if step_index is not None and step_index < self.max_steps:
+            step_idx_tensor = torch.tensor(
+                step_index, device=hidden_states.device, dtype=torch.long
+            )
+            step_emb = self.step_embeddings(step_idx_tensor)
+            hidden_states = hidden_states + step_emb
+        
         # Pre-norm attention
         residual = hidden_states
         hidden_states = self.ln1(hidden_states)
@@ -164,73 +184,76 @@ class RecursiveTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_adaptive_halting: bool = False,
         halting_eps: float = 0.01,
-    ) -> Tuple[torch.Tensor, int]:
+        step_offset: int = 0,
+    ) -> Tuple[torch.Tensor, int, Optional[torch.Tensor]]:
         """
-        Recursive application of the block.
-
-        Applies the same block multiple times (weight sharing). When
-        ``use_adaptive_halting`` is True and a halting head is present, this
-        implements a differentiable PonderNet/ACT-style mechanism: at each step
-        the halting head produces a per-token halting probability, and the final
-        output is a halting-probability-weighted combination of the per-step
-        hidden states. Because the output mixes states with weights that depend
-        on the halting head, gradients flow into the halting head through the
-        downstream loss (no non-differentiable early ``break``).
-
-        The expected ponder cost (expected number of steps) is recorded on
-        ``self._last_ponder_cost`` so callers can add it as a regularizer.
-
-        When ``use_adaptive_halting`` is False (or no halting head exists) the
-        behavior is identical to plain fixed-depth recursion.
-
+        Recursive application of the block with step embeddings and ACT.
+        
+        Applies the same block multiple times (weight sharing),
+        optionally with adaptive halting based on learned probabilities.
+        When ACT is enabled, returns probability-weighted average of hidden
+        states and a differentiable ponder cost.
+        
         Args:
             hidden_states: Input tensor [batch, seq_len, hidden_size].
             steps_max: Maximum number of recursion steps.
             attention_mask: Optional attention mask.
             use_adaptive_halting: Whether to use learned halting.
-            halting_eps: Unused tolerance kept for backward compatibility.
-
+            halting_eps: Threshold for halting (1 - eps).
+            step_offset: Offset for step embedding indices (for reasoning continuity).
+            
         Returns:
-            Tuple of (output hidden states, number of steps taken).
+            Tuple of (output hidden states, actual steps, ponder_cost or None).
         """
         batch_size, seq_len, _ = hidden_states.shape
         device = hidden_states.device
-
-        adaptive = use_adaptive_halting and self.halting_head is not None
-
-        if not adaptive:
-            # Plain fixed-depth recursion (identical to original behavior).
-            for _ in range(steps_max):
-                hidden_states, _ = self.forward(hidden_states, attention_mask)
-            self._last_ponder_cost = torch.zeros((), device=device)
-            return hidden_states, steps_max
-
-        # --- Differentiable PonderNet/ACT-style halting ---
-        # remainder: probability mass not yet allocated, per token [B, L].
-        remainder = torch.ones(batch_size, seq_len, device=device)
-        weighted_output = torch.zeros_like(hidden_states)
-        # Expected number of steps accumulator, per token [B, L].
-        expected_steps = torch.zeros(batch_size, seq_len, device=device)
-
-        for t in range(steps_max):
-            hidden_states, p_halt = self.forward(hidden_states, attention_mask)
-
-            if t == steps_max - 1:
-                # Last step takes all remaining mass so weights sum to 1.
-                step_weight = remainder
-            else:
-                step_weight = remainder * p_halt
-
-            # Accumulate halting-probability-weighted hidden state.
-            weighted_output = weighted_output + step_weight.unsqueeze(-1) * hidden_states
-            # Expected steps: sum over steps of weight * (step index + 1).
-            expected_steps = expected_steps + step_weight * (t + 1)
-            # Reduce remaining probability mass.
-            remainder = remainder * (1.0 - p_halt)
-
-        # Mean expected number of steps across tokens/batch (scalar tensor).
-        self._last_ponder_cost = expected_steps.mean()
-        return weighted_output, steps_max
+        
+        if use_adaptive_halting and self.halting_head is not None:
+            # Differentiable ACT: probability-weighted output averaging
+            cum_halt = torch.zeros(batch_size, seq_len, device=device)
+            accumulated_output = torch.zeros_like(hidden_states)
+            ponder_cost = torch.zeros(batch_size, seq_len, device=device)
+            
+            actual_steps = 0
+            for t in range(steps_max):
+                step_idx = t + step_offset
+                hidden_states, p_halt = self.forward(
+                    hidden_states, attention_mask, step_index=step_idx
+                )
+                actual_steps += 1
+                
+                # Compute increment: min(p_halt, remaining probability)
+                still_active = (cum_halt < 1.0 - halting_eps).float()
+                increment = torch.minimum(p_halt, 1.0 - cum_halt) * still_active
+                
+                # Accumulate weighted output
+                accumulated_output = accumulated_output + increment.unsqueeze(-1) * hidden_states
+                
+                # Differentiable ponder cost: increment * (step + 1)
+                ponder_cost = ponder_cost + increment * (t + 1)
+                
+                cum_halt = cum_halt + increment
+                
+                if (cum_halt >= 1.0 - halting_eps).all():
+                    break
+            
+            # Handle remainder probability
+            remainder = (1.0 - cum_halt).clamp(min=0)
+            accumulated_output = accumulated_output + remainder.unsqueeze(-1) * hidden_states
+            ponder_cost = ponder_cost + remainder * steps_max
+            
+            return accumulated_output, actual_steps, ponder_cost
+        else:
+            # Fixed-depth recursion (no ACT)
+            actual_steps = 0
+            for t in range(steps_max):
+                step_idx = t + step_offset
+                hidden_states, p_halt = self.forward(
+                    hidden_states, attention_mask, step_index=step_idx
+                )
+                actual_steps += 1
+            
+            return hidden_states, actual_steps, None
 
 
 class RecursiveTransformerStack(nn.Module):
@@ -250,15 +273,10 @@ class RecursiveTransformerStack(nn.Module):
         window_size: int = 256,
         dropout: float = 0.1,
         use_halting: bool = False,
-        use_rope: bool = True,
-        global_token_indices=None,
+        max_steps: int = 8,
     ):
         super().__init__()
-
-        # Track the last expected ponder cost (mean expected steps) so callers
-        # can retrieve it after a forward pass. Defaults to a zero scalar.
-        self._last_ponder_cost = None
-
+        
         self.blocks = nn.ModuleList([
             RecursiveTransformerBlock(
                 hidden_size=hidden_size,
@@ -267,8 +285,7 @@ class RecursiveTransformerStack(nn.Module):
                 window_size=window_size,
                 dropout=dropout,
                 use_halting=use_halting,
-                use_rope=use_rope,
-                global_token_indices=global_token_indices,
+                max_steps=max_steps,
             )
             for _ in range(num_blocks)
         ])
@@ -279,32 +296,27 @@ class RecursiveTransformerStack(nn.Module):
         steps_per_block: int = 4,
         attention_mask: Optional[torch.Tensor] = None,
         use_adaptive_halting: bool = False,
-    ) -> Tuple[torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, int, Optional[torch.Tensor]]:
         """
         Forward pass through all blocks with recursion.
-
-        When ``use_adaptive_halting`` is True, the expected ponder cost (mean
-        expected number of steps) is accumulated across blocks and stored on
-        ``self._last_ponder_cost`` as a scalar tensor. Otherwise it is set to a
-        zero scalar tensor.
-
+        
         Returns:
-            Tuple of (output, total steps taken across all blocks).
+            Tuple of (output, total steps taken, aggregated ponder cost or None).
         """
-        device = hidden_states.device
         total_steps = 0
-        ponder_cost = torch.zeros((), device=device)
+        total_ponder_cost = None
         for block in self.blocks:
-            hidden_states, steps = block.recur(
+            hidden_states, steps, ponder_cost = block.recur(
                 hidden_states,
                 steps_max=steps_per_block,
                 attention_mask=attention_mask,
                 use_adaptive_halting=use_adaptive_halting,
             )
             total_steps += steps
-            block_cost = getattr(block, "_last_ponder_cost", None)
-            if block_cost is not None:
-                ponder_cost = ponder_cost + block_cost
-
-        self._last_ponder_cost = ponder_cost
-        return hidden_states, total_steps
+            if ponder_cost is not None:
+                if total_ponder_cost is None:
+                    total_ponder_cost = ponder_cost
+                else:
+                    total_ponder_cost = total_ponder_cost + ponder_cost
+        
+        return hidden_states, total_steps, total_ponder_cost

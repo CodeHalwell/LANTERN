@@ -76,23 +76,34 @@ class LANTERNConfig:
     # Recursion
     steps_base: int = 4
     steps_reasoning: int = 8
+    max_steps: int = 8
     use_adaptive_halting: bool = False
     halting_eps: float = 0.01
     
-    # Uncertainty weights
-    entropy_weight: float = 1.0
-    dispersion_weight: float = 0.5
-    p_max_weight: float = -0.5
-    epistemic_weight: float = 0.3
+    # Latent pause
+    max_pause_steps: int = 4
     
-    # Uncertainty thresholds
+    # Uncertainty weights (v3-final: 2-term formula)
+    dispersion_weight: float = 0.6  # α for semantic dispersion
+    epistemic_weight: float = 0.4   # λ for epistemic uncertainty
+    
+    # Legacy uncertainty weights (kept for backward compatibility)
+    entropy_weight: float = 1.0
+    p_max_weight: float = -0.5
+    
+    # Adaptive uncertainty thresholds (EMA-based)
+    ema_decay: float = 0.99  # γ for EMA
     tau_low: float = 1.0
     tau_mid: float = 2.0
     tau_high: float = 3.0
     top_k_dispersion: int = 10
     
-    # Bayesian
+    # Bayesian / Epistemic probe
     num_bayesian_samples: int = 5
+    
+    # ACT ponder cost
+    ponder_lambda: float = 0.01
+    ponder_warmup_steps: int = 500
     
     # Generation
     max_new_tokens: int = 100
@@ -120,18 +131,16 @@ class LANTERNConfig:
             "dropout": self.dropout,
             "use_halting": self.use_adaptive_halting,
             "use_rope": self.use_rope,
+            "max_steps": self.max_steps,
+            "max_pause_steps": self.max_pause_steps,
         }
     
     def to_uncertainty_config(self) -> dict:
         """Extract uncertainty controller configuration."""
         return {
-            "entropy_weight": self.entropy_weight,
             "dispersion_weight": self.dispersion_weight,
-            "p_max_weight": self.p_max_weight,
             "epistemic_weight": self.epistemic_weight,
-            "tau_low": self.tau_low,
-            "tau_mid": self.tau_mid,
-            "tau_high": self.tau_high,
+            "ema_decay": self.ema_decay,
             "temperature": self.temperature,
             "top_k_dispersion": self.top_k_dispersion,
         }
@@ -163,6 +172,7 @@ def create_small_config() -> LANTERNConfig:
         window_size=64,
         steps_base=2,
         steps_reasoning=4,
+        max_steps=8,
     )
 
 
@@ -176,6 +186,7 @@ def create_base_config() -> LANTERNConfig:
         window_size=256,
         steps_base=4,
         steps_reasoning=8,
+        max_steps=8,
     )
 
 
@@ -189,4 +200,23 @@ def create_large_config() -> LANTERNConfig:
         window_size=512,
         steps_base=6,
         steps_reasoning=12,
+        max_steps=12,
+    )
+
+
+def create_tiny_lantern_config() -> LANTERNConfig:
+    """Create TinyLANTERN configuration (~20M parameters) from the spec."""
+    return LANTERNConfig(
+        hidden_size=384,
+        num_heads=6,
+        intermediate_size=1536,
+        num_blocks=1,
+        vocab_size=32000,
+        max_position=512,
+        window_size=256,
+        max_steps=8,
+        steps_base=4,
+        steps_reasoning=8,
+        dropout=0.1,
+        use_adaptive_halting=True,
     )

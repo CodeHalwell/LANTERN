@@ -68,6 +68,19 @@ def iter_text_file(path: str, limit: Optional[int]) -> Iterator[str]:
                     break
 
 
+def choose_val_docs(requested: int, n_docs: int) -> int:
+    """
+    Held-out document count for a finite source of ``n_docs`` documents.
+    Never consumes the whole corpus: falls back to a tenth (at least one
+    document, leaving at least one for training).
+    """
+    if n_docs <= 1:
+        raise ValueError("need at least two documents to make a train/val split")
+    if requested < n_docs:
+        return requested
+    return max(1, min(n_docs - 1, n_docs // 10))
+
+
 def take(it: Iterable[str], n: int) -> Iterator[str]:
     for i, x in enumerate(it):
         if i >= n:
@@ -154,8 +167,15 @@ def main():
         val_docs = iter_hf_docs(args.dataset, "validation", args.val_docs)
         train_skip = 0
     else:
-        val_docs = take(all_docs(), args.val_docs)
-        train_skip = args.val_docs
+        n_val_docs = args.val_docs
+        if args.dataset == "text":
+            n_docs = sum(1 for _ in all_docs())
+            n_val_docs = choose_val_docs(args.val_docs, n_docs)
+            if n_val_docs != args.val_docs:
+                print(f"  note: {n_docs} documents in total; holding out {n_val_docs} "
+                      f"instead of --val_docs {args.val_docs} so training keeps the rest")
+        val_docs = take(all_docs(), n_val_docs)
+        train_skip = n_val_docs
     n_val = write_tokens(val_docs, tokenizer, out_dir / "val.bin")
     print(f"  val: {n_val:,} tokens")
 
@@ -172,6 +192,8 @@ def main():
 
     n_train = write_tokens(train_docs(), tokenizer, out_dir / "train.bin")
     print(f"  train: {n_train:,} tokens")
+    if n_train == 0:
+        ap.error("no training documents were written; lower --val_docs or supply more data")
 
     meta = {
         "dataset": args.dataset,

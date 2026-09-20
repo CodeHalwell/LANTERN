@@ -91,9 +91,31 @@ def collect(model, loader, depth_lo, depth_hi, fixed_depths, pause_hi, device, m
     return losses, sig
 
 
+def required_fixed_depths(fixed_depths, d_lo, d_hi, fractions):
+    """
+    The fixed depths to evaluate so that every matched-compute depth (under
+    both cost models) is bracketed by the curve. Adds the integer floor /
+    ceiling of the extreme mean depths when the requested list does not
+    already cover them.
+    """
+    depths = {int(d) for d in fixed_depths} | {int(d_lo), int(d_hi)}
+    lo = min((1 - f) * d_lo + f * d_hi for f in fractions)
+    hi = max(d_lo + f * d_hi for f in fractions)
+    if min(depths) > lo:
+        depths.add(max(1, math.floor(lo)))
+    if max(depths) < hi:
+        depths.add(math.ceil(hi))
+    return sorted(depths)
+
+
 def interp_fixed(fixed_curve, mean_depth):
-    """Linear interpolation of fixed-depth loss in log(depth)."""
+    """Linear interpolation of fixed-depth loss in log(depth); refuses to extrapolate."""
     ds = np.array(sorted(fixed_curve))
+    if not ds.min() <= mean_depth <= ds.max():
+        raise ValueError(
+            f"mean depth {mean_depth:.2f} lies outside the evaluated fixed depths "
+            f"{ds.tolist()}; add a bracketing depth to --fixed_depths"
+        )
     ls = np.array([fixed_curve[d] for d in ds])
     return float(np.interp(math.log(mean_depth), np.log(ds), ls))
 
@@ -124,7 +146,12 @@ def main():
     ds = MemmapDataset(Path(args.data_dir) / "val.bin", seq_len)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-    losses, sig = collect(model, loader, d_lo, d_hi, args.fixed_depths, args.pause_hi,
+    fixed_depths = required_fixed_depths(args.fixed_depths, d_lo, d_hi, args.fractions)
+    extra = sorted(set(fixed_depths) - set(args.fixed_depths) - {d_lo, d_hi})
+    if extra:
+        print(f"note: also evaluating fixed depth(s) {extra} so every matched-compute "
+              f"depth is bracketed by the fixed curve")
+    losses, sig = collect(model, loader, d_lo, d_hi, fixed_depths, args.pause_hi,
                           args.device, args.batches)
     n_tokens = len(losses[d_lo])
     fixed_curve = {d: float(losses[d].mean()) for d in losses if isinstance(d, int)}

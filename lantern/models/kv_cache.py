@@ -71,6 +71,27 @@ class KVCache:
         self.v_cache[step, :, :, seq_pos, :] = v
         self.seq_len = max(self.seq_len, seq_pos + 1)
 
+    def write(self, step: int, start_pos: int, k: torch.Tensor, v: torch.Tensor):
+        """
+        Write KV for a contiguous run of positions at one depth.
+
+        Args:
+            step: Recursion depth index.
+            start_pos: First sequence position to write.
+            k: Keys [batch, heads, n, head_dim].
+            v: Values [batch, heads, n, head_dim].
+        """
+        n = k.shape[-2]
+        end = start_pos + n
+        if end > self.max_seq_len:
+            raise ValueError(
+                f"KV cache overflow: writing positions {start_pos}..{end - 1} "
+                f"into a cache of length {self.max_seq_len}"
+            )
+        self.k_cache[step, :, :, start_pos:end, :] = k.to(self.k_cache.dtype)
+        self.v_cache[step, :, :, start_pos:end, :] = v.to(self.v_cache.dtype)
+        self.seq_len = max(self.seq_len, end)
+
     def get_slice(self, step: int) -> tuple:
         """
         Get the full KV cache for a given depth step.
@@ -97,9 +118,43 @@ class KVCache:
             pos: Sequence position to carry forward.
             depth: The depth at which the token finished processing.
         """
-        for future_step in range(depth + 1, self.max_steps):
-            self.k_cache[future_step, :, :, pos, :] = self.k_cache[depth, :, :, pos, :]
-            self.v_cache[future_step, :, :, pos, :] = self.v_cache[depth, :, :, pos, :]
+        self.carry_forward_range(pos, pos + 1, depth)
+
+    def carry_forward_range(self, start_pos: int, end_pos: int, depth: int):
+        """Carry forward a contiguous run of positions from ``depth`` to deeper slots."""
+        if depth + 1 >= self.max_steps:
+            return
+        src_k = self.k_cache[depth, :, :, start_pos:end_pos, :]
+        src_v = self.v_cache[depth, :, :, start_pos:end_pos, :]
+        self.k_cache[depth + 1:, :, :, start_pos:end_pos, :] = src_k.unsqueeze(0)
+        self.v_cache[depth + 1:, :, :, start_pos:end_pos, :] = src_v.unsqueeze(0)
+
+    def select_rows(self, rows: torch.Tensor) -> "KVCache":
+        """
+        A new cache holding copies of the given batch rows (index tensor).
+        Used to run a deeper pass on a subset of a batch without touching
+        the other rows' cache entries.
+        """
+        sub = KVCache.__new__(KVCache)
+        sub.max_steps = self.max_steps
+        sub.batch_size = int(rows.numel())
+        sub.num_heads = self.num_heads
+        sub.max_seq_len = self.max_seq_len
+        sub.head_dim = self.head_dim
+        sub.seq_len = self.seq_len
+        sub.k_cache = self.k_cache[:, rows].clone()
+        sub.v_cache = self.v_cache[:, rows].clone()
+        return sub
+
+    def write_rows_from(self, other: "KVCache", rows: torch.Tensor, start_pos: int, end_pos: int):
+        """Copy positions start_pos..end_pos-1 of ``other`` (all steps) into ``rows`` of this cache."""
+        self.k_cache[:, rows, :, start_pos:end_pos] = other.k_cache[:, :, :, start_pos:end_pos]
+        self.v_cache[:, rows, :, start_pos:end_pos] = other.v_cache[:, :, :, start_pos:end_pos]
+        self.seq_len = max(self.seq_len, end_pos)
+
+    def truncate(self, seq_len: int):
+        """Drop cached positions beyond ``seq_len`` (used to rewind a rejected token)."""
+        self.seq_len = min(self.seq_len, seq_len)
 
     def reset(self):
         """Reset the cache for a new sequence."""

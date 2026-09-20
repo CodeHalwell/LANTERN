@@ -2,20 +2,24 @@
 Tests for LANTERN three-phase training curriculum.
 """
 
+import copy
+import random
+
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from lantern.models.lantern_model import LANTERNModel
-from lantern.utils.config import create_small_config
 from lantern.training import (
     Phase1Trainer,
     Phase2Trainer,
     Phase3Trainer,
-    selective_dropout_train,
+    binary_to_additive_mask,
     compute_ponder_cost_masked,
+    selective_dropout_train,
 )
-
+from lantern.utils.config import create_small_config
 
 TEST_VOCAB_SIZE = 100
 
@@ -239,3 +243,111 @@ class TestPhase3Trainer:
         assert "ce_loss" in metrics
         assert "ponder_cost" in metrics
         assert "ponder_lambda" in metrics
+
+
+class TestPhase2Validation:
+    def test_requires_two_mc_samples(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        with pytest.raises(ValueError):
+            Phase2Trainer(model, loader, num_mc_samples=1)
+        Phase2Trainer(model, loader, num_mc_samples=2)
+
+
+class TestGradientAccumulation:
+    """A list of batches must all contribute to one optimizer step."""
+
+    def test_phase1_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase1Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        it = iter(loader)
+        batches = [next(it), next(it)]
+        random.seed(0)
+        loss = trainer.train_step(batches)
+        assert isinstance(loss, float) and loss > 0
+
+    def test_accumulated_step_uses_every_batch(self):
+        """Two distinct batches -> the update differs from a step on either one alone."""
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.dropout = 0.0
+        base = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        it = iter(loader)
+        b1, b2 = next(it), next(it)
+
+        def step_with(batch):
+            model = copy.deepcopy(base)
+            trainer = Phase1Trainer(model, loader, max_steps=10, warmup_steps=0,
+                                    learning_rate=1e-2, use_bfloat16=False,
+                                    min_depth=1, max_depth=1)
+            trainer.train_step(batch)
+            return torch.cat([p.detach().flatten() for p in model.parameters()])
+
+        both = step_with([b1, b2])
+        only1 = step_with(b1)
+        only2 = step_with(b2)
+        assert not torch.allclose(both, only1)
+        assert not torch.allclose(both, only2)
+
+    def test_phase2_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase2Trainer(model, loader, num_mc_samples=2, max_steps=2)
+        it = iter(loader)
+        before = model.epistemic_probe.net[0].weight.detach().clone()
+        loss = trainer.train_step([next(it), next(it)])
+        assert isinstance(loss, float) and loss >= 0
+        assert not torch.equal(before, model.epistemic_probe.net[0].weight.detach())
+
+    def test_phase3_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.use_adaptive_halting = True
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase3Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        it = iter(loader)
+        out = trainer.train_step([next(it), next(it)])
+        assert out["total_loss"] > 0
+
+    def test_empty_list_rejected(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase1Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        with pytest.raises(ValueError):
+            trainer.train_step([])
+
+
+class TestPaddingMask:
+    def test_binary_to_additive_shape_and_values(self):
+        mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+        add = binary_to_additive_mask(mask)
+        assert add.shape == (2, 1, 1, 3)
+        assert add[0, 0, 0, 0] == 0 and add[0, 0, 0, 2] == float("-inf")
+        assert add[1, 0, 0, 1] == float("-inf")
+
+    def test_phase3_masks_padding_keys(self):
+        """Real-token logits must not depend on the content of padded positions."""
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.dropout = 0.0
+        model = LANTERNModel(config).eval()
+        x = torch.randint(0, TEST_VOCAB_SIZE, (1, 8))
+        y = x.clone()
+        y[0, 6:] = (y[0, 6:] + 1) % TEST_VOCAB_SIZE  # change the padded tail
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        add = binary_to_additive_mask(mask)
+        with torch.no_grad():
+            a, _, _ = model(x, attention_mask=add)
+            b, _, _ = model(y, attention_mask=add)
+        assert torch.allclose(a[0, :6], b[0, :6], atol=1e-5)

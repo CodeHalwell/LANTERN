@@ -1,280 +1,99 @@
-# LANTERN Training Examples
+# LANTERN Examples
 
-This directory contains example scripts and data for training LANTERN models.
+Worked commands for the common cases. TRAINING.md explains what each phase
+and script does; this file is just recipes.
 
-## Quick Start Examples
-
-### 1. Test Training (Small Model, Synthetic Data)
-
-Verify the training pipeline works:
-
-**Note**: The provided `example_data.txt` is a small demonstration file. For meaningful training, use a larger dataset or reduce `seq_length` to 64 or lower.
+## Smoke test on CPU (a couple of minutes)
 
 ```bash
-python train.py \
-    --config small \
-    --data_path example_data.txt \
-    --max_steps 100 \
-    --batch_size 2 \
-    --seq_length 64 \
-    --output_dir ./outputs/test_run
+python train.py --data_path example_data.txt --config small --vocab_size 512 --seq_length 64 \
+    --batch_size 4 --phase all --phase1_steps 50 --phase2_steps 10 --phase3_steps 20 \
+    --eval_interval 25 --output_dir outputs/smoke
+
+python generate.py --checkpoint outputs/smoke/final_model.pt --prompt "The" --max_tokens 20
 ```
 
-### 2. Character-Level Text Generation
+The tokenizer trained on the fly is saved as `outputs/smoke/tokenizer.json`
+and recorded in every checkpoint.
 
-Train on the provided example data:
+## TinyStories, base model, one GPU
 
 ```bash
-python train.py \
-    --config small \
-    --data_path example_data.txt \
-    --max_steps 5000 \
-    --batch_size 8 \
-    --seq_length 128 \
-    --eval_interval 500 \
-    --save_interval 1000 \
-    --output_dir ./outputs/char_model
+python scripts/prepare_data.py --dataset tinystories --out_dir data/tinystories --vocab_size 8192
+
+python train.py --data_dir data/tinystories --config base --phase all \
+    --phase1_steps 20000 --phase2_steps 2000 --phase3_steps 5000 \
+    --batch_size 32 --seq_length 512 --eval_interval 1000 --save_interval 5000 \
+    --output_dir outputs/base-ts
 ```
 
-### 3. Base Model Training
-
-For production-quality models:
+Then the two experiments:
 
 ```bash
-python train.py \
-    --config base \
-    --data_path your_large_dataset.txt \
-    --val_data_path your_validation_data.txt \
-    --max_steps 100000 \
-    --batch_size 16 \
-    --seq_length 512 \
-    --learning_rate 3e-4 \
-    --warmup_steps 1000 \
-    --eval_interval 1000 \
-    --save_interval 5000 \
-    --output_dir ./outputs/base_model
+python scripts/eval_depth.py --checkpoint outputs/base-ts/phase1_final.pt \
+    --data_dir data/tinystories --depths 1 2 4 8 --batches 100
+
+python scripts/experiment_adaptive_depth.py --checkpoint outputs/base-ts/phase3_final.pt \
+    --data_dir data/tinystories --depth_lo 2 --depth_hi 8 --pause_hi 2 \
+    --fractions 0.1 0.25 0.5 --batches 100 --out results/base-ts.json
 ```
 
-### 4. Resume Training from Checkpoint
-
-Continue training from a saved checkpoint:
+## Resume a phase
 
 ```bash
-python train.py \
-    --resume_from ./outputs/base_model/checkpoint_step_50000.pt \
-    --data_path your_dataset.txt \
-    --max_steps 150000
+python train.py --data_dir data/tinystories --resume_from outputs/base-ts/phase1_final.pt \
+    --phase 2 --phase2_steps 2000 --output_dir outputs/base-ts
+python train.py --data_dir data/tinystories --resume_from outputs/base-ts/phase2_final.pt \
+    --phase 3 --phase3_steps 5000 --output_dir outputs/base-ts
 ```
 
-## Using Trained Models
+Phase 3 needs halting enabled. `--phase all` turns it on when the model is
+created; for a resumed Phase 3 the checkpoint must have been created with
+`use_adaptive_halting=True` (start the original run with `--phase all`).
 
-### Basic Generation
-
-Generate text using a trained model:
+## 300M on FineWeb-Edu
 
 ```bash
-python generate.py \
-    --checkpoint ./outputs/char_model/best_model.pt \
-    --prompt "1,2,3,4,5" \
-    --max_tokens 50 \
-    --temperature 0.8
+python scripts/prepare_data.py --dataset fineweb-edu --out_dir data/fineweb-edu \
+    --vocab_size 32000 --max_train_docs 3000000
+
+python train.py --data_dir data/fineweb-edu --config 300m --phase 1 \
+    --phase1_steps 60000 --batch_size 8 --grad_accum 8 --seq_length 1024 \
+    --warmup_steps 2000 --compile --attn_impl flex --output_dir outputs/300m
 ```
 
-### Custom Model Sizes
+See the 300M section of TRAINING.md for the compute and memory budget.
 
-Train with custom architecture:
+## Generation
 
 ```bash
-python train.py \
-    --config base \
-    --hidden_size 768 \
-    --num_heads 12 \
-    --num_blocks 3 \
-    --data_path your_dataset.txt \
-    --output_dir ./outputs/custom_model
+# fixed depth, two latent pause cycles per token
+python generate.py --checkpoint outputs/base-ts/final_model.pt --prompt "Once upon a time" \
+    --depth 4 --pause_steps 2 --temperature 0.8
+
+# escalate ~20% of tokens by step-KL to depth 8 + 2 pause cycles, show the trace
+python generate.py --checkpoint outputs/base-ts/final_model.pt --prompt "Once upon a time" \
+    --signal step_kl --escalate_fraction 0.2 --deep_depth 8 --pause_steps 2 \
+    --data_dir data/tinystories --trace
+
+# same with the epistemic probe, explicit threshold
+python generate.py --checkpoint outputs/base-ts/final_model.pt --prompt "Once upon a time" \
+    --signal probe --threshold 0.3 --pause_steps 2
 ```
 
-## Dataset Preparation
+## Custom architecture
 
-### Character-Level
+Any preset can be overridden from the command line:
 
-The training script includes simple character-level tokenization by default:
-- Each unique character gets a token ID
-- Suitable for small datasets and testing
-- Works out-of-the-box with any text file
+```bash
+python train.py --data_dir data/tinystories --config base \
+    --hidden_size 768 --num_heads 12 --num_blocks 3 --window_size 128 --dropout 0.05
+```
 
-### Token-Level (Recommended for Production)
-
-For production use, replace the `TextDataset` class to use proper tokenization:
+Or in Python:
 
 ```python
-# Example with Hugging Face tokenizer
-from transformers import AutoTokenizer
-
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-
-# Tokenize your data
-text = "Your training text here"
-tokens = tokenizer.encode(text)
+from lantern.utils.config import LANTERNConfig
+config = LANTERNConfig(hidden_size=768, num_heads=12, num_blocks=3,
+                       steps_base=3, steps_reasoning=6, max_steps=6, attn_impl="sdpa")
 ```
-
-Then modify `train.py` to use these pre-tokenized datasets.
-
-## Training Tips
-
-### GPU Training
-
-LANTERN works best on GPU:
-
-```bash
-python train.py \
-    --config base \
-    --device cuda \
-    --batch_size 32 \
-    --data_path your_dataset.txt
-```
-
-### Mixed Precision (Optional)
-
-For faster training on modern GPUs, you can add mixed precision support:
-
-```python
-from torch.cuda.amp import autocast, GradScaler
-
-# In the training loop
-scaler = GradScaler()
-
-with autocast():
-    loss = compute_loss(batch)
-
-scaler.scale(loss).backward()
-scaler.step(optimizer)
-scaler.update()
-```
-
-### Distributed Training (Optional)
-
-For multi-GPU training, use PyTorch DDP:
-
-```bash
-torchrun --nproc_per_node=4 train.py \
-    --config base \
-    --data_path your_dataset.txt
-```
-
-## Monitoring Training
-
-### Training Logs
-
-Metrics are saved to `training_log.jsonl`:
-
-```bash
-# View training progress
-tail -f outputs/your_model/training_log.jsonl
-
-# Parse with Python
-import json
-with open('outputs/your_model/training_log.jsonl') as f:
-    for line in f:
-        metrics = json.loads(line)
-        print(f"Step {metrics['step']}: Loss {metrics.get('train_loss', 'N/A')}")
-```
-
-### Tensorboard (Optional)
-
-Add Tensorboard logging for visualization:
-
-```python
-from torch.utils.tensorboard import SummaryWriter
-
-writer = SummaryWriter(log_dir='./runs/experiment_name')
-writer.add_scalar('Loss/train', loss, step)
-```
-
-Then view with:
-
-```bash
-tensorboard --logdir=./runs
-```
-
-## Model Variants
-
-### Small (Testing/Prototyping)
-- Hidden size: 256
-- Heads: 4
-- Blocks: 1
-- Parameters: ~660K
-- Good for: Testing, small datasets, CPU training
-
-### Base (Production)
-- Hidden size: 512
-- Heads: 8
-- Blocks: 2
-- Parameters: ~2.6M
-- Good for: Most applications, balanced quality/speed
-
-### Custom (Advanced)
-- Define your own architecture
-- Scale up for better quality
-- Scale down for faster inference
-
-## Advanced Features
-
-### Uncertainty-Aware Generation
-
-After training, use the uncertainty controller for adaptive generation:
-
-```python
-from lantern import GenerationController, UncertaintyController
-
-# See generate.py for full example
-controller = GenerationController(...)
-```
-
-### Bayesian Refinement
-
-Enable Bayesian refinement during generation for high-uncertainty decisions:
-
-```python
-gen_config = GenerationConfig(
-    num_bayesian_samples=5,  # More samples = better uncertainty estimation
-)
-```
-
-### Adaptive Recursion
-
-The model automatically adjusts computation depth based on difficulty:
-- Base mode: 4 steps (config.steps_base)
-- Reasoning mode: 8 steps (config.steps_reasoning)
-- Triggered by uncertainty thresholds
-
-## Common Issues
-
-### Out of Memory
-- Reduce `--batch_size`
-- Reduce `--seq_length`
-- Use smaller model (`--config small`)
-- Enable gradient checkpointing (requires code modification)
-
-### Training Unstable
-- Increase `--warmup_steps`
-- Decrease `--learning_rate`
-- Check `--grad_clip` is enabled (default: 1.0)
-- Verify data quality
-
-### Poor Generation Quality
-- Train for more steps
-- Use larger model (`--config base`)
-- Increase dataset size
-- Lower temperature during generation
-- Use validation set to prevent overfitting
-
-## Next Steps
-
-1. Train a small model on example data
-2. Evaluate on your specific task
-3. Scale up model size as needed
-4. Integrate with your application
-5. Experiment with uncertainty-aware generation
-
-For more details, see [TRAINING.md](TRAINING.md) in the repository root.

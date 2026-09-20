@@ -57,3 +57,6 @@ Thumbs.db
 logs/
 outputs/
 wandb/
+data/
+results/
+*.bin

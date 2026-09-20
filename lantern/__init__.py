@@ -24,6 +24,10 @@ from lantern.uncertainty.bayesian import BayesianSampler
 from lantern.uncertainty.epistemic_probe import EpistemicProbe
 from lantern.controller.uncertainty_controller import UncertaintyController
 from lantern.controller.generation import GenerationController
+from lantern.controller.adaptive_generation import (
+    AdaptiveGenerationConfig,
+    AdaptiveGenerator,
+)
 
 __all__ = [
     "RecursiveTransformerBlock",
@@ -38,4 +42,6 @@ __all__ = [
     "BayesianSampler",
     "UncertaintyController",
     "GenerationController",
+    "AdaptiveGenerator",
+    "AdaptiveGenerationConfig",
 ]

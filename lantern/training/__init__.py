@@ -19,9 +19,10 @@ Phase 3: Controller Unlock
   - Pad token dilution masking in ponder cost
 """
 
+import math
 import random
 from contextlib import contextmanager, nullcontext
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -57,6 +58,62 @@ def selective_dropout_train(model: nn.Module):
         for module, state in dropout_layers:
             module.train(state)
         model.train(was_training)
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup then cosine decay to ``min_lr_ratio`` of the peak."""
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / warmup_steps
+        if total_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _autocast(device: str, enabled: bool):
+    """bf16 autocast on CUDA when enabled; a no-op context otherwise."""
+    if enabled and device.startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+Batch = Dict[str, torch.Tensor]
+
+
+def _micro_batches(batch: Union[Batch, Sequence[Batch]]) -> List[Batch]:
+    """
+    A trainer's ``train_step`` takes either one loader batch or a list of
+    them. A list means gradient accumulation: every batch contributes to the
+    same optimizer step, so the effective batch is ``len(list) * batch_size``.
+    """
+    if isinstance(batch, dict):
+        return [batch]
+    batches = list(batch)
+    if not batches:
+        raise ValueError("train_step needs at least one batch")
+    return batches
+
+
+def binary_to_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Turn a binary padding mask [batch, seq_len] (1 = real token) into the
+    additive key mask the attention layers expect: 0 for real keys, -inf for
+    padding keys, shaped [batch, 1, 1, seq_len] so it broadcasts over heads
+    and query positions.
+    """
+    additive = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device)
+    additive = additive.masked_fill(attention_mask == 0, float("-inf"))
+    return additive[:, None, None, :]
 
 
 def compute_ponder_cost_masked(
@@ -103,6 +160,10 @@ class Phase1Trainer:
         max_steps: int = 10000,
         grad_clip: float = 1.0,
         device: str = "cpu",
+        min_depth: int = 1,
+        max_depth: Optional[int] = None,
+        use_bfloat16: bool = True,
+        min_lr_ratio: float = 0.1,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -111,43 +172,71 @@ class Phase1Trainer:
         self.max_steps = max_steps
         self.warmup_steps = warmup_steps
         self.grad_clip = grad_clip
+        self.min_depth = min_depth
+        self.max_depth = max_depth if max_depth is not None else model.config.max_steps
+        self.use_bfloat16 = use_bfloat16
 
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=learning_rate, weight_decay=weight_decay,
             betas=(0.9, 0.95),
         )
-        self.lr_lambda = (
-            lambda step: min(1.0, step / warmup_steps) if warmup_steps > 0 else 1.0
-        )
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, self.lr_lambda
+        self.scheduler = build_lr_scheduler(
+            self.optimizer, warmup_steps, max_steps, min_lr_ratio
         )
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single Phase 1 training step with random depth."""
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> float:
+        """
+        Single Phase 1 optimizer step with a random recursion depth.
 
-        # Randomly vary depth each batch (Section 10, Phase 1)
-        max_depth = self.model.config.max_steps
-        random_depth = random.randint(1, max_depth)
-
-        logits, _, _ = self.model(input_ids, steps_per_block=random_depth)
-
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            reduction="mean",
-        )
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over (see ``_micro_batches``).
+        """
+        # One depth per optimizer step so every step embedding gets trained.
+        random_depth = random.randint(self.min_depth, self.max_depth)
+        micro_batches = _micro_batches(batch)
 
         self.optimizer.zero_grad()
-        loss.backward()
+        total = 0.0
+        for micro in micro_batches:
+            input_ids = micro["input_ids"].to(self.device)
+            labels = micro["labels"].to(self.device)
+            with _autocast(self.device, self.use_bfloat16):
+                logits, _, _ = self.model(input_ids, steps_per_block=random_depth)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)).float(),
+                    labels.view(-1),
+                    reduction="mean",
+                )
+            (loss / len(micro_batches)).backward()
+            total += loss.item() / len(micro_batches)
+
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optimizer.step()
         self.scheduler.step()
+        return total
 
-        return loss.item()
+    @torch.no_grad()
+    def evaluate(self, depth: Optional[int] = None, max_batches: Optional[int] = None) -> float:
+        """Mean validation loss at a fixed depth (config.steps_base if None)."""
+        if self.val_loader is None:
+            return float("nan")
+        was_training = self.model.training
+        self.model.eval()
+        total, n = 0.0, 0
+        for i, batch in enumerate(self.val_loader):
+            if max_batches is not None and i >= max_batches:
+                break
+            input_ids = batch["input_ids"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            with _autocast(self.device, self.use_bfloat16):
+                logits, _, _ = self.model(input_ids, steps_per_block=depth)
+            total += F.cross_entropy(
+                logits.view(-1, logits.size(-1)).float(), labels.view(-1)
+            ).item()
+            n += 1
+        self.model.train(was_training)
+        return total / max(1, n)
 
 
 class Phase2Trainer:
@@ -167,6 +256,11 @@ class Phase2Trainer:
         max_steps: int = 2000,
         device: str = "cpu",
     ):
+        if num_mc_samples < 2:
+            raise ValueError(
+                "num_mc_samples must be at least 2: the distillation target is the "
+                "variance across MC-dropout samples"
+            )
         self.model = model.to(device)
         self.train_loader = train_loader
         self.device = device
@@ -183,39 +277,46 @@ class Phase2Trainer:
             model.epistemic_probe.parameters(), lr=learning_rate,
         )
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single Phase 2 distillation step."""
+    def _distillation_loss(self, batch: Batch) -> torch.Tensor:
+        """MSE between the probe and MC-dropout variance for one loader batch."""
         input_ids = batch["input_ids"].to(self.device)
 
-        # Get hidden states from frozen backbone (eval mode)
+        # Hidden states from the frozen backbone (eval mode)
         self.model.eval()
         with torch.no_grad():
-            _, hidden_states, _ = self.model(
-                input_ids, return_hidden_states=True,
-            )
+            _, hidden_states, _ = self.model(input_ids, return_hidden_states=True)
 
-        # MC Dropout sampling with selective dropout
-        mc_logits = []
+        # MC Dropout sampling with only the dropout layers in train mode
+        mc_probs = []
         for _ in range(self.num_mc_samples):
             with selective_dropout_train(self.model):
                 with torch.no_grad():
                     sample_logits, _, _ = self.model(input_ids)
-                    mc_logits.append(F.softmax(sample_logits, dim=-1))
+                    mc_probs.append(F.softmax(sample_logits, dim=-1))
 
-        # Stack: [num_samples, batch, seq_len, vocab_size]
-        all_probs = torch.stack(mc_logits, dim=0)
-        # Variance across samples, summed over vocab -> [batch, seq_len]
-        mc_variance = all_probs.var(dim=0).sum(dim=-1)
+        # [num_samples, batch, seq_len, vocab] -> variance summed over vocab
+        # -> [batch, seq_len]. Bounded in [0, 1), matching the probe's sigmoid.
+        mc_variance = torch.stack(mc_probs, dim=0).var(dim=0).sum(dim=-1)
 
-        # Train probe to predict this variance
         probe_pred = self.model.epistemic_probe(hidden_states.detach())
-        loss = F.mse_loss(probe_pred, mc_variance.detach())
+        return F.mse_loss(probe_pred, mc_variance.detach())
 
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> float:
+        """
+        Single Phase 2 distillation step.
+
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over.
+        """
+        micro_batches = _micro_batches(batch)
         self.optimizer.zero_grad()
-        loss.backward()
+        total = 0.0
+        for micro in micro_batches:
+            loss = self._distillation_loss(micro)
+            (loss / len(micro_batches)).backward()
+            total += loss.item() / len(micro_batches)
         self.optimizer.step()
-
-        return loss.item()
+        return total
 
     def cleanup(self):
         """Unfreeze backbone after Phase 2."""
@@ -250,6 +351,9 @@ class Phase3Trainer:
         grad_clip: float = 1.0,
         use_bfloat16: bool = True,
         device: str = "cpu",
+        warmup_steps: int = 0,
+        pause_prob: float = 0.5,
+        min_lr_ratio: float = 0.1,
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -260,6 +364,10 @@ class Phase3Trainer:
         self.ponder_lambda = ponder_lambda
         self.ponder_warmup_steps = ponder_warmup_steps
         self.use_bfloat16 = use_bfloat16 and device != "cpu"
+        # Fraction of optimizer steps that apply 1..max_pause_steps latent
+        # pause cycles to the whole sequence, so the pause module is trained
+        # exactly the way cached decoding uses it.
+        self.pause_prob = pause_prob
 
         # Differential learning rates
         backbone_params = []
@@ -286,6 +394,9 @@ class Phase3Trainer:
             weight_decay=weight_decay,
             betas=(0.9, 0.95),
         )
+        self.scheduler = build_lr_scheduler(
+            self.optimizer, warmup_steps, max_steps, min_lr_ratio
+        )
 
         self.step = 0
 
@@ -295,58 +406,67 @@ class Phase3Trainer:
             return self.ponder_lambda
         return min(self.step / self.ponder_warmup_steps, 1.0) * self.ponder_lambda
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Single Phase 3 training step with ACT."""
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)
-        attention_mask = batch.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
+    def _sample_pause_steps(self) -> int:
+        if random.random() < self.pause_prob:
+            return random.randint(1, self.model.config.max_pause_steps)
+        return 0
 
-        # Use bfloat16 mixed precision
-        amp_dtype = torch.bfloat16 if self.use_bfloat16 else None
-        ctx = (
-            torch.autocast(device_type=self.device, dtype=amp_dtype)
-            if amp_dtype is not None
-            else nullcontext()
-        )
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> Dict[str, float]:
+        """
+        Single Phase 3 optimizer step with ACT and random latent pause.
 
-        with ctx:
-            logits, _, ponder_cost = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                use_adaptive_halting=True,
-            )
-
-            # Cross-entropy loss
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                reduction="mean",
-            )
-
-            # Ponder cost with warmup and pad dilution fix
-            current_lambda = self._get_ponder_lambda()
-            if ponder_cost is not None and current_lambda > 0:
-                masked_ponder = compute_ponder_cost_masked(
-                    ponder_cost, attention_mask
-                )
-                total_loss = ce_loss + current_lambda * masked_ponder
-            else:
-                masked_ponder = torch.tensor(0.0, device=self.device)
-                total_loss = ce_loss
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over.
+        """
+        pause_steps = self._sample_pause_steps()
+        current_lambda = self._get_ponder_lambda()
+        micro_batches = _micro_batches(batch)
+        n_micro = len(micro_batches)
 
         self.optimizer.zero_grad()
-        total_loss.backward()
+        acc = {"total_loss": 0.0, "ce_loss": 0.0, "ponder_cost": 0.0}
+        for micro in micro_batches:
+            input_ids = micro["input_ids"].to(self.device)
+            labels = micro["labels"].to(self.device)
+            attention_mask = micro.get("attention_mask")
+            additive_mask = None
+            if attention_mask is not None:
+                # Binary mask for the ponder accounting; additive for attention.
+                attention_mask = attention_mask.to(self.device)
+                additive_mask = binary_to_additive_mask(attention_mask)
+
+            with _autocast(self.device, self.use_bfloat16):
+                logits, _, ponder_cost = self.model(
+                    input_ids,
+                    attention_mask=additive_mask,
+                    use_adaptive_halting=True,
+                    pause_steps=pause_steps,
+                )
+                ce_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)).float(),
+                    labels.view(-1),
+                    reduction="mean",
+                )
+                if ponder_cost is not None and current_lambda > 0:
+                    masked_ponder = compute_ponder_cost_masked(
+                        ponder_cost.float(), attention_mask
+                    )
+                    total_loss = ce_loss + current_lambda * masked_ponder
+                else:
+                    masked_ponder = torch.tensor(0.0, device=self.device)
+                    total_loss = ce_loss
+
+            (total_loss / n_micro).backward()
+            acc["total_loss"] += total_loss.item() / n_micro
+            acc["ce_loss"] += ce_loss.item() / n_micro
+            acc["ponder_cost"] += masked_ponder.item() / n_micro
+
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optimizer.step()
-
+        self.scheduler.step()
         self.step += 1
 
-        return {
-            "total_loss": total_loss.item(),
-            "ce_loss": ce_loss.item(),
-            "ponder_cost": masked_ponder.item(),
-            "ponder_lambda": current_lambda,
-        }
+        acc["ponder_lambda"] = current_lambda
+        acc["pause_steps"] = pause_steps
+        return acc

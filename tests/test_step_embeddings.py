@@ -83,3 +83,20 @@ class TestStepEmbeddings:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestStepEmbeddingBeyondMaxSteps:
+    def test_reuses_final_embedding(self):
+        """Steps past max_steps must add the last step embedding, not none."""
+        torch.manual_seed(0)
+        block = RecursiveTransformerBlock(
+            hidden_size=32, num_heads=2, intermediate_size=64, window_size=8,
+            dropout=0.0, max_steps=3,
+        ).eval()
+        x = torch.randn(1, 5, 32)
+        with torch.no_grad():
+            beyond, _ = block(x, step_index=7)
+            last, _ = block(x, step_index=2)
+            none, _ = block(x, step_index=None)
+        assert torch.allclose(beyond, last, atol=1e-6)
+        assert not torch.allclose(beyond, none, atol=1e-6)

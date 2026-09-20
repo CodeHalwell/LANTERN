@@ -1,7 +1,13 @@
 """
-Generation Controller for LANTERN.
+Generation Controller for LANTERN (legacy).
 
-Implements the full decoding loop with:
+This controller works on pre-computed hidden states and its ``generate``
+loop does not feed sampled tokens back into the model. It is kept for the
+uncertainty-routing logic and its tests. For actual text generation use
+``lantern.controller.adaptive_generation.AdaptiveGenerator``, which runs the
+real model through the KV cache.
+
+Implements the decoding decision logic with:
 - Uncertainty-aware sampling
 - THINK token injection for reasoning mode
 - Adaptive recursion depth

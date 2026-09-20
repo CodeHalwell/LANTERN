@@ -1,281 +1,187 @@
-# Training LANTERN for Text Generation
+# Training LANTERN
 
-This guide explains how to train the LANTERN model on NLP tasks like text generation.
+The pipeline is: prepare data → three training phases → depth sweep →
+adaptive-depth experiment → generation. Every step has a script.
 
-## Quick Start
+```
+scripts/prepare_data.py            corpus → BPE tokenizer + train.bin / val.bin
+train.py                           Phase 1 / 2 / 3 (or all)
+scripts/eval_depth.py              loss vs recursion depth from one checkpoint
+scripts/experiment_adaptive_depth.py   adaptive vs fixed depth at matched compute
+generate.py                        fixed-depth or uncertainty-triggered generation
+```
 
-### Basic Training
-
-Train on a text file with default settings:
+## 1. Data
 
 ```bash
-python train.py --data_path your_data.txt
+pip install -e ".[data]"
+
+# TinyStories (~470M tokens). Good for models up to ~50M parameters.
+python scripts/prepare_data.py --dataset tinystories --out_dir data/tinystories --vocab_size 8192
+
+# FineWeb-Edu 10B-token sample. Use this for the 300M model.
+python scripts/prepare_data.py --dataset fineweb-edu --out_dir data/fineweb-edu \
+    --vocab_size 32000 --max_train_docs 3000000
+
+# Any text file, one document per line
+python scripts/prepare_data.py --dataset text --text_path my.txt --out_dir data/mine
 ```
 
-### Small Model (for testing/prototyping)
+This writes `tokenizer.json`, `train.bin`, `val.bin` (flat `uint16`, documents
+separated by `<eos>`) and `meta.json`. Special ids are fixed: `<pad>=0`,
+`<bos>=1`, `<eos>=2`.
+
+## 2. The three phases
+
+| Phase | What trains | Loss | Notes |
+|---|---|---|---|
+| 1 | everything except probe/pause/halting | next-token CE | recursion depth sampled uniformly in `1..max_steps` per step so every step embedding is trained |
+| 2 | epistemic probe only | MSE to MC-dropout variance | backbone frozen and in eval mode; only `nn.Dropout` layers are switched on for sampling |
+| 3 | everything, ACT on | CE + λ·ponder | λ ramps linearly; backbone LR 1e-5, reasoning heads 1e-3; half the steps also apply 1..`max_pause_steps` latent pause cycles so the pause module is trained the way decoding uses it |
 
 ```bash
-python train.py \
-    --config small \
-    --data_path example_data.txt \
-    --max_steps 10000 \
-    --batch_size 8 \
-    --output_dir ./outputs/small_model
+# CPU smoke test (a couple of minutes)
+python train.py --data_path example_data.txt --config small --vocab_size 512 --seq_length 64 \
+    --phase all --phase1_steps 50 --phase2_steps 10 --phase3_steps 20 --output_dir outputs/smoke
+
+# TinyStories, base config (31M), one GPU
+python train.py --data_dir data/tinystories --config base --phase all \
+    --phase1_steps 20000 --phase2_steps 2000 --phase3_steps 5000 \
+    --batch_size 32 --seq_length 512 --output_dir outputs/base-ts
+
+# Resume a later phase from a checkpoint
+python train.py --data_dir data/tinystories --resume_from outputs/base-ts/phase1_final.pt \
+    --phase 2 --phase2_steps 2000 --output_dir outputs/base-ts
 ```
 
-### Base Model (for production use)
+Checkpoints are `phase{N}_best.pt`, `phase{N}_final.pt` and `final_model.pt`.
+Each holds the model state, the config and the tokenizer path. Metrics go to
+`training_log.jsonl`.
+
+Useful flags: `--grad_accum N`, `--compile`, `--attn_impl flex` (CUDA),
+`--no_bf16`, `--window_size`, `--dropout`.
+
+## 3. The 300M model
 
 ```bash
-python train.py \
-    --config base \
-    --data_path your_data.txt \
-    --val_data_path your_val_data.txt \
-    --max_steps 100000 \
-    --batch_size 16 \
-    --learning_rate 3e-4 \
-    --output_dir ./outputs/base_model
+python train.py --data_dir data/fineweb-edu --config 300m --phase 1 \
+    --phase1_steps 60000 --batch_size 8 --grad_accum 8 --seq_length 1024 \
+    --learning_rate 3e-4 --warmup_steps 2000 --compile --output_dir outputs/300m
 ```
 
-## Data Format
+What `--config 300m` is:
 
-The training script expects plain text files. Each file should contain the text you want the model to learn from.
+| | |
+|---|---|
+| hidden / heads / MLP | 1536 / 12 / 6144 |
+| blocks (weight-shared) | 6 |
+| steps base / reasoning / max | 2 / 4 / 4 |
+| window | 512 |
+| parameters | 317M total, 265M non-embedding |
 
-Example (`data.txt`):
-```
-This is the first sentence in your training data.
-This is the second sentence.
-You can have as many sentences as you want.
-```
+Things to know before you press go:
 
-The script will:
-1. Load the text file
-2. Create sequences of length `--seq_length` (default: 512)
-3. Train the model to predict the next token in each sequence
+- **Compute is set by depth, not parameters.** At `steps_base=2` a forward
+  pass costs the same as a 12-layer dense model of this width; at
+  `steps_reasoning=4` it is 24 layers. Phase 1 samples depths 1..4, so it
+  averages about 15 layers. Budget as if training a ~600M dense model.
+- **Tokens.** The command above sees 8 × 8 × 1024 × 60000 ≈ 3.9B tokens. That
+  is under-trained by Chinchilla standards (6B for 300M) but enough to answer
+  the research question. TinyStories is too small and too easy for this size.
+- **Memory.** bf16 weights + AdamW state ≈ 4GB; activations dominate. On a
+  24GB card use `--batch_size 4 --grad_accum 16`; on 80GB, `--batch_size 32`.
+- **Attention.** `sdpa` (default) uses fused kernels that never materialise
+  the L×L score matrix, but still computes all of it. `--attn_impl flex`
+  is genuinely block-sparse and is the one that delivers the O(L·w) cost;
+  it needs CUDA and benefits from `--compile`. Attention dropout is
+  skipped on the flex path.
+- **Dropout stays on (0.1).** Phase 2 distils MC-dropout variance; with
+  dropout 0 there is nothing to distil.
 
-**Note**: The current implementation uses character-level tokenization for simplicity. For production use, replace this with a proper tokenizer like BPE or SentencePiece by modifying the `TextDataset` class.
+Run the base config on TinyStories first. If depth does not help there,
+it will not help at 300M either, and you will have found out in an hour
+rather than a week.
 
-## Configuration Options
-
-### Model Configuration
-
-- `--config`: Choose preset configuration (`small` or `base`)
-  - `small`: 256 hidden size, 4 heads, 1 block (for testing)
-  - `base`: 512 hidden size, 8 heads, 2 blocks (for production)
-
-- `--vocab_size`: Vocabulary size (default: 32000)
-- `--hidden_size`: Override hidden dimension
-- `--num_heads`: Override number of attention heads
-- `--num_blocks`: Override number of transformer blocks
-
-### Training Configuration
-
-- `--batch_size`: Training batch size (default: 8)
-- `--learning_rate`: Learning rate (default: 3e-4)
-- `--weight_decay`: Weight decay for AdamW (default: 0.1)
-- `--max_steps`: Maximum training steps (default: 10000)
-- `--warmup_steps`: Learning rate warmup steps (default: 100)
-- `--grad_clip`: Gradient clipping threshold (default: 1.0)
-
-### Data Configuration
-
-- `--data_path`: Path to training data file
-- `--val_data_path`: Path to validation data file (optional)
-- `--seq_length`: Sequence length for training (default: 512)
-
-### Output Configuration
-
-- `--output_dir`: Directory for checkpoints and logs (default: ./outputs)
-- `--eval_interval`: Steps between evaluations (default: 500)
-- `--save_interval`: Steps between checkpoint saves (default: 1000)
-
-### Device Configuration
-
-- `--device`: Device to train on (`cuda` or `cpu`, auto-detected by default)
-
-## Checkpoints
-
-The trainer saves several types of checkpoints:
-
-1. **Regular checkpoints**: `checkpoint_step_N.pt` - Saved every `--save_interval` steps
-2. **Best model**: `best_model.pt` - Saved when validation loss improves
-3. **Final model**: `final_model.pt` - Saved at the end of training
-
-### Resuming Training
-
-Resume from a checkpoint:
+## 4. Step 1: does depth help?
 
 ```bash
-python train.py \
-    --resume_from ./outputs/checkpoint_step_5000.pt \
-    --data_path your_data.txt
+python scripts/eval_depth.py --checkpoint outputs/base-ts/phase1_final.pt \
+    --data_dir data/tinystories --depths 1 2 4 8 --pause_steps 0 2 --batches 100
 ```
 
-## Training Logs
+Prints loss and perplexity per depth from the same weights. Expected: loss
+falls with depth up to `max_steps` and flattens. If depth 8 is not better
+than depth 2, the backbone has not learned to use recursion and the
+adaptive question is moot.
 
-Training metrics are logged to `training_log.jsonl` in the output directory. Each line is a JSON object with metrics:
+## 5. Step 3: adaptive vs fixed depth at matched compute
 
-```json
-{"step": 100, "epoch": 0, "train_loss": 3.45, "learning_rate": 0.0001, "elapsed_time": 12.3}
-{"step": 500, "val_loss": 3.21}
+```bash
+python scripts/experiment_adaptive_depth.py --checkpoint outputs/base-ts/phase3_final.pt \
+    --data_dir data/tinystories --depth_lo 2 --depth_hi 8 --fixed_depths 1 2 4 8 \
+    --pause_hi 2 --fractions 0.1 0.25 0.5 --batches 100 --out results/adaptive.json
 ```
 
-## Using Your Trained Model
+Teacher-forced on validation text. For every token it records the loss at
+the shallow and deep depth plus three signals read at the shallow depth:
+entropy, the epistemic probe, and step-KL (how much the distribution moved
+between the last two recursion steps). A policy escalates the top `f`
+fraction of tokens by its signal; its mean depth is `(1-f)·d_lo + f·d_hi`,
+and it is compared with the fixed-depth curve interpolated at that mean
+depth.
 
-After training, you can use your model for generation:
+Read the table like this:
+
+- `delta < 0` means the adaptive policy beats uniform depth at the same
+  average compute.
+- `random` is the control. A signal that does not beat random is not a
+  signal.
+- `oracle` escalates the tokens where depth actually helped most. It is the
+  ceiling; if even the oracle barely beats fixed depth, per-token routing
+  cannot win on this data.
+- `corr(signal, gain)` is the cheap summary: which signal predicts where
+  depth helps.
+
+Caveat: the deep pass deepens the whole context, whereas generation only
+deepens escalated tokens. This measures the per-token benefit of depth,
+which is what the trigger must predict.
+
+## 6. Generation
+
+```bash
+# fixed depth
+python generate.py --checkpoint outputs/base-ts/final_model.pt --prompt "Once upon a time" --depth 4
+
+# uncertainty-triggered: calibrate a threshold so ~20% of tokens escalate,
+# escalated tokens run at steps_reasoning plus 2 latent pause cycles
+python generate.py --checkpoint outputs/base-ts/final_model.pt --prompt "Once upon a time" \
+    --signal step_kl --escalate_fraction 0.2 --pause_steps 2 --data_dir data/tinystories --trace
+```
+
+`--trace` prints each token with its signal value, whether it escalated and
+the depth it got. Thresholds are absolute; `--escalate_fraction` picks one
+from validation data so runs are comparable.
+
+In Python:
 
 ```python
-import torch
-from lantern.models.lantern_model import LANTERNModel
-from lantern.utils.config import create_base_config
+from lantern import AdaptiveGenerator, AdaptiveGenerationConfig
+from lantern.controller.adaptive_generation import collect_signals, calibrate_threshold
 
-# Load config
-config = create_base_config()
-
-# Create model
-model = LANTERNModel(config)
-
-# Load checkpoint securely
-try:
-    # Use weights_only=True for security (PyTorch >= 1.13)
-    checkpoint = torch.load("./outputs/best_model.pt", weights_only=True)
-except TypeError:
-    # Fallback for older PyTorch versions
-    # WARNING: Only load checkpoints from trusted sources
-    checkpoint = torch.load("./outputs/best_model.pt")
-
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-
-# Generate text (simple version)
-input_ids = torch.tensor([[1, 2, 3]])  # Your input tokens
-output = model.generate(
-    input_ids,
-    max_new_tokens=100,
-    temperature=0.8,
-    top_p=0.9,
-)
-
-print(output)
+signals = collect_signals(model, val_loader, device=device, max_batches=20)
+thr = calibrate_threshold(signals["step_kl"], escalate_fraction=0.2)
+gen = AdaptiveGenerator(model, AdaptiveGenerationConfig(signal="step_kl", threshold=thr, pause_steps=2))
+result = gen.generate(input_ids)
+print(tokenizer.decode(result.tokens[0].tolist()), result.escalation_rate)
 ```
-
-## Advanced: Uncertainty-Aware Generation
-
-For uncertainty-aware generation with THINK tokens and adaptive recursion:
-
-```python
-from lantern import GenerationController, UncertaintyController
-from lantern.controller.generation import GenerationConfig
-
-# Create uncertainty controller
-uncertainty_controller = UncertaintyController(
-    tau_low=1.0,
-    tau_mid=2.0,
-    tau_high=3.0,
-)
-
-# Create generation config with THINK token
-gen_config = GenerationConfig(
-    max_new_tokens=100,
-    temperature=0.8,
-    think_token_id=50256,  # Your THINK token ID
-    eos_token_id=50257,    # Your EOS token ID
-)
-
-# Create generation controller
-controller = GenerationController(
-    model=model.transformer,
-    lm_head=model.lm_head,
-    embedding_matrix=model.get_embedding_matrix(),
-    uncertainty_controller=uncertainty_controller,
-    config=gen_config,
-    recur_fn=lambda h, steps_max: model.transformer(h, steps_per_block=steps_max),
-)
-
-# Generate with uncertainty awareness
-# Note: Requires proper hidden state management
-```
-
-## Tips for Better Training
-
-1. **Start small**: Use `--config small` to test your data and training pipeline
-2. **Use validation data**: Provide `--val_data_path` to monitor overfitting
-3. **Adjust sequence length**: Longer sequences (`--seq_length`) capture more context but use more memory
-4. **Learning rate**: Try 3e-4 (default) or 1e-4 for more stable training
-5. **Batch size**: Increase for faster training (if you have enough memory)
-6. **Gradient clipping**: Keep at 1.0 to prevent exploding gradients
-7. **Warmup**: Use 100-1000 warmup steps depending on total training length
-
-## Model Architecture Features
-
-LANTERN combines several advanced features:
-
-- **Recursive Sparse Transformer**: Weight-shared blocks for efficient depth-on-demand
-- **Sliding Window Attention**: O(L × w) complexity instead of O(L²)
-- **Uncertainty Estimation**: Multi-signal uncertainty (entropy, semantic dispersion, Bayesian)
-- **Adaptive Computation**: Dynamic recursion depth based on difficulty
-
-These features are automatically included in the model. The training script focuses on standard language modeling loss, but the trained model can later be used with the uncertainty-aware generation controller for advanced inference.
 
 ## Troubleshooting
 
-### Out of Memory
-
-- Reduce `--batch_size`
-- Reduce `--seq_length`
-- Use `--config small`
-
-### Loss Not Decreasing
-
-- Check your data format
-- Increase `--warmup_steps`
-- Decrease `--learning_rate`
-- Check for data preprocessing issues
-
-### Training Too Slow
-
-- Increase `--batch_size` (if memory allows)
-- Use GPU: `--device cuda`
-- Reduce `--seq_length` for faster iterations
-
-## Example Training Commands
-
-### Character-level Shakespeare
-
-```bash
-# Download shakespeare data
-wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-
-# Train
-python train.py \
-    --config small \
-    --data_path input.txt \
-    --seq_length 256 \
-    --batch_size 16 \
-    --max_steps 50000 \
-    --output_dir ./outputs/shakespeare
-```
-
-### Custom Dataset
-
-```bash
-python train.py \
-    --config base \
-    --data_path ./data/train.txt \
-    --val_data_path ./data/val.txt \
-    --seq_length 512 \
-    --batch_size 8 \
-    --max_steps 100000 \
-    --eval_interval 1000 \
-    --save_interval 5000 \
-    --output_dir ./outputs/custom_model
-```
-
-## Next Steps
-
-After training:
-
-1. Evaluate your model on test data
-2. Experiment with uncertainty-aware generation using `GenerationController`
-3. Fine-tune on specific downstream tasks
-4. Integrate with production inference pipelines
-5. Explore the uncertainty estimation features for confidence calibration
+- **Loss not falling in Phase 1:** lower the LR to 1e-4, raise warmup, check
+  the tokenizer round-trips your text.
+- **Phase 3 loss jumps:** lower `--ponder_lambda` or lengthen its warmup;
+  ACT is sensitive to λ.
+- **Out of memory:** smaller `--batch_size` with larger `--grad_accum`,
+  shorter `--seq_length`, or `--attn_impl flex` on CUDA.
+- **Probe outputs are all the same:** Phase 2 ran with dropout 0, or too few
+  steps. Check `mc_variance` is not ~0 in the logs.

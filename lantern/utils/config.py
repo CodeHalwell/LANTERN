@@ -69,6 +69,10 @@ class LANTERNConfig:
     
     # Positional encoding
     use_rope: bool = True
+
+    # Attention backend: "eager" (reference), "sdpa" (fused, memory-efficient),
+    # "flex" (block-sparse FlexAttention, CUDA only; falls back to sdpa on CPU)
+    attn_impl: str = "sdpa"
     
     # Dropout
     dropout: float = 0.1
@@ -133,6 +137,8 @@ class LANTERNConfig:
             "use_rope": self.use_rope,
             "max_steps": self.max_steps,
             "max_pause_steps": self.max_pause_steps,
+            "attn_impl": self.attn_impl,
+            "max_position": self.max_position,
         }
     
     def to_uncertainty_config(self) -> dict:
@@ -201,6 +207,36 @@ def create_large_config() -> LANTERNConfig:
         steps_base=6,
         steps_reasoning=12,
         max_steps=12,
+    )
+
+
+def create_300m_config() -> LANTERNConfig:
+    """
+    ~300M unique parameters (about 320M with a 32k vocabulary).
+
+    Six weight-shared blocks at hidden size 1536. With steps_base=2 every
+    forward pass costs the same as a 12-layer dense model of the same width,
+    and steps_reasoning=4 costs a 24-layer one. Phase 1 samples depths 1..4
+    so the average training cost is about 15 layers. Budget for a 24GB GPU
+    with bf16, batch 8 x 1024 tokens and gradient accumulation.
+
+    Dropout stays at 0.1 because Phase 2 distils MC-dropout variance into
+    the probe; with dropout 0 there is no epistemic signal to distil.
+    """
+    return LANTERNConfig(
+        hidden_size=1536,
+        num_heads=12,
+        intermediate_size=6144,
+        num_blocks=6,
+        vocab_size=32000,
+        max_position=2048,
+        window_size=512,
+        steps_base=2,
+        steps_reasoning=4,
+        max_steps=4,
+        max_pause_steps=4,
+        dropout=0.1,
+        use_adaptive_halting=True,
     )
 
 

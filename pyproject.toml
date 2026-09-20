@@ -35,9 +35,14 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.0.0",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
+data = [
+    "tokenizers>=0.15",
+    "datasets>=2.16",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",

@@ -62,9 +62,12 @@ def save_checkpoint(model: LANTERNModel, path: Path, phase: int, step: int,
                     tokenizer_path: Optional[str], extra: Optional[dict] = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+    config = asdict(raw.config)
+    # Plain lists only, so the checkpoint loads under weights_only=True.
+    config["global_token_indices"] = sorted(config["global_token_indices"])
     payload = {
         "model_state_dict": raw.state_dict(),
-        "config": asdict(raw.config),
+        "config": config,
         "phase": phase,
         "step": step,
         "tokenizer_path": tokenizer_path,
@@ -76,7 +79,18 @@ def save_checkpoint(model: LANTERNModel, path: Path, phase: int, step: int,
 
 
 def load_checkpoint(path: str, device: str):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    """Load a checkpoint written by ``save_checkpoint`` -> (model, checkpoint dict).
+
+    Uses ``weights_only=True`` so the file is never a code-execution vector;
+    checkpoints hold only tensors, numbers, strings, lists and dicts.
+    """
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+    except Exception as e:  # noqa: BLE001 - surface a clear message for any unpickling failure
+        raise RuntimeError(
+            f"Could not load {path} with weights_only=True. Only checkpoints written by "
+            f"train.py are supported; the file may be corrupt or from an old format. ({e})"
+        ) from e
     cfg = ckpt["config"]
     if isinstance(cfg.get("global_token_indices"), list):
         cfg["global_token_indices"] = set(cfg["global_token_indices"])

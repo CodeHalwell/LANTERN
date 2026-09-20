@@ -132,13 +132,19 @@ class RecursiveTransformerBlock(nn.Module):
             step_emb = self.step_embeddings.weight[step_index]
             hidden_states = hidden_states + step_emb
 
+        # Depths beyond max_steps reuse the last step embedding; the cache
+        # slot is clamped the same way so deep runs never index past it.
+        cache_step = 0
+        if kv_cache is not None and step_index is not None:
+            cache_step = min(step_index, kv_cache.max_steps - 1)
+
         residual = hidden_states
         hidden_states = self.ln1(hidden_states)
         hidden_states = self.attention(
             hidden_states,
             attention_mask,
             kv_cache=kv_cache,
-            cache_step=step_index or 0,
+            cache_step=cache_step,
             start_pos=start_pos,
         )
         hidden_states = self.dropout(hidden_states)
@@ -238,7 +244,9 @@ class RecursiveTransformerBlock(nn.Module):
         if kv_cache is not None and actual_steps > 0:
             # Tokens that ran fewer steps than the cache holds must still be
             # visible at deeper slots to later tokens that recurse further.
-            kv_cache.carry_forward_range(start_pos, start_pos + seq_len, last_step_idx)
+            kv_cache.carry_forward_range(
+                start_pos, start_pos + seq_len, min(last_step_idx, kv_cache.max_steps - 1)
+            )
 
         return output, actual_steps, ponder_cost
 

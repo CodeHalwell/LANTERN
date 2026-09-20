@@ -1,5 +1,6 @@
 """Tests for the model-level cache, pause steps, step trace and generate()."""
 
+import pytest
 import torch
 
 from lantern.models.lantern_model import LANTERNModel, sample_from_logits
@@ -110,6 +111,15 @@ class TestGenerate:
         assert out.shape == (2, 5)
         assert (out[:, -1] == 7).all()
 
+    def test_depth_beyond_max_steps_uses_last_cache_slot(self):
+        """steps_per_block > max_steps must not index past the cache (clamped like the step embedding)."""
+        m, cfg = _model()
+        x = torch.randint(0, cfg.vocab_size, (2, 6))
+        deep = cfg.max_steps + 3
+        a = m.generate(x, max_new_tokens=8, temperature=0, steps_per_block=deep, use_cache=True)
+        b = m.generate(x, max_new_tokens=8, temperature=0, steps_per_block=deep, use_cache=False)
+        assert torch.equal(a, b)
+
     def test_respects_max_position(self):
         m, cfg = _model(max_position=16)
         x = torch.randint(0, cfg.vocab_size, (1, 12))
@@ -123,6 +133,28 @@ class TestGenerate:
         for _ in range(20):
             tok = sample_from_logits(logits, temperature=1.0, top_k=1).item()
             assert tok == 3
+
+
+class TestCheckpointIO:
+    def test_save_and_load_roundtrip_weights_only(self, tmp_path):
+        from train import load_checkpoint, save_checkpoint
+
+        m, cfg = _model()
+        path = tmp_path / "ckpt.pt"
+        save_checkpoint(m, path, phase=1, step=7, tokenizer_path="tok.json")
+        loaded, ckpt = load_checkpoint(str(path), "cpu")
+        assert ckpt["phase"] == 1 and ckpt["step"] == 7 and ckpt["tokenizer_path"] == "tok.json"
+        assert loaded.config == cfg
+        x = torch.randint(0, cfg.vocab_size, (1, 5))
+        assert torch.allclose(m(x)[0], loaded.eval()(x)[0])
+
+    def test_load_rejects_arbitrary_pickle(self, tmp_path):
+        from train import load_checkpoint
+
+        path = tmp_path / "bad.pt"
+        torch.save({"config": {"x": object()}}, path)
+        with pytest.raises(RuntimeError):
+            load_checkpoint(str(path), "cpu")
 
 
 class TestConfigs:

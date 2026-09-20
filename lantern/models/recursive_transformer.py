@@ -133,11 +133,18 @@ class RecursiveTransformerBlock(nn.Module):
             step_emb = self.step_embeddings.weight[min(step_index, self.max_steps - 1)]
             hidden_states = hidden_states + step_emb
 
-        # Depths beyond max_steps reuse the last step embedding; the cache
-        # slot is clamped the same way so deep runs never index past it.
+        # Every recursion step has its own cache slot: the K/V of a prefix
+        # token differ per step, so aliasing two steps into one slot would
+        # make cached decoding diverge from a full forward pass.
         cache_step = 0
         if kv_cache is not None and step_index is not None:
-            cache_step = min(step_index, kv_cache.max_steps - 1)
+            if step_index >= kv_cache.max_steps:
+                raise ValueError(
+                    f"recursion step {step_index} needs a cache slot but the cache holds "
+                    f"{kv_cache.max_steps}; create the caches with max_steps >= the depth "
+                    f"you intend to run (see LANTERNModel.create_kv_caches)"
+                )
+            cache_step = step_index
 
         residual = hidden_states
         hidden_states = self.ln1(hidden_states)
@@ -245,9 +252,7 @@ class RecursiveTransformerBlock(nn.Module):
         if kv_cache is not None and actual_steps > 0:
             # Tokens that ran fewer steps than the cache holds must still be
             # visible at deeper slots to later tokens that recurse further.
-            kv_cache.carry_forward_range(
-                start_pos, start_pos + seq_len, min(last_step_idx, kv_cache.max_steps - 1)
-            )
+            kv_cache.carry_forward_range(start_pos, start_pos + seq_len, last_step_idx)
 
         return output, actual_steps, ponder_cost
 

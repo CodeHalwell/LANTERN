@@ -111,14 +111,27 @@ class TestGenerate:
         assert out.shape == (2, 5)
         assert (out[:, -1] == 7).all()
 
-    def test_depth_beyond_max_steps_uses_last_cache_slot(self):
-        """steps_per_block > max_steps must not index past the cache (clamped like the step embedding)."""
+    def test_depth_beyond_max_steps_matches_full_forward(self):
+        """generate() sizes its caches for the requested depth, so logits match a full forward."""
         m, cfg = _model()
         x = torch.randint(0, cfg.vocab_size, (2, 6))
         deep = cfg.max_steps + 3
         a = m.generate(x, max_new_tokens=8, temperature=0, steps_per_block=deep, use_cache=True)
         b = m.generate(x, max_new_tokens=8, temperature=0, steps_per_block=deep, use_cache=False)
         assert torch.equal(a, b)
+        # And at the logit level, not just the argmax.
+        full, _, _ = m(x, steps_per_block=deep)
+        caches = m.create_kv_caches(2, 16, torch.device("cpu"), max_steps=deep)
+        m(x[:, :4], steps_per_block=deep, kv_caches=caches, start_pos=0)
+        step, _, _ = m(x[:, 4:5], steps_per_block=deep, kv_caches=caches, start_pos=4)
+        assert torch.allclose(step[:, 0], full[:, 4], atol=1e-4)
+
+    def test_undersized_cache_is_rejected(self):
+        m, cfg = _model()
+        x = torch.randint(0, cfg.vocab_size, (1, 4))
+        caches = m.create_kv_caches(1, 16, torch.device("cpu"))  # config.max_steps slots
+        with pytest.raises(ValueError):
+            m(x, steps_per_block=cfg.max_steps + 1, kv_caches=caches)
 
     def test_respects_max_position(self):
         m, cfg = _model(max_position=16)

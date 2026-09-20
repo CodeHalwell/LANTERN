@@ -118,7 +118,8 @@ class AdaptiveGenerator:
             return result
 
         caches = model.create_kv_caches(
-            batch_size, prompt_len + budget, device, dtype=model.token_embedding.weight.dtype
+            batch_size, prompt_len + budget, device, dtype=model.token_embedding.weight.dtype,
+            max_steps=max(model.config.max_steps, steps_base, steps_deep),
         )
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 

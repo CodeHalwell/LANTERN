@@ -218,15 +218,22 @@ class LANTERNModel(nn.Module):
         max_seq_len: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        max_steps: Optional[int] = None,
     ) -> List[KVCache]:
         """
         One depth-indexed cache per transformer block plus a single-slot
         cache for the pause module's context. Pass the list to ``forward``.
+
+        Args:
+            max_steps: Cache slots per block, i.e. the deepest
+                ``steps_per_block`` that will be run through these caches.
+                Defaults to ``config.max_steps``.
         """
         head_dim = self.config.hidden_size // self.config.num_heads
+        slots = max_steps if max_steps is not None else self.config.max_steps
         caches = [
             KVCache(
-                max_steps=self.config.max_steps,
+                max_steps=slots,
                 batch_size=batch_size,
                 num_heads=self.config.num_heads,
                 max_seq_len=max_seq_len,
@@ -302,9 +309,11 @@ class LANTERNModel(nn.Module):
 
         caches = None
         if use_cache:
+            depth = steps_per_block if steps_per_block is not None else self.config.steps_base
             caches = self.create_kv_caches(
                 batch_size, prompt_len + budget, device,
                 dtype=self.token_embedding.weight.dtype,
+                max_steps=max(self.config.max_steps, depth),
             )
 
         generated = input_ids

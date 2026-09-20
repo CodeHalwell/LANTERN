@@ -91,16 +91,18 @@ def collect(model, loader, depth_lo, depth_hi, fixed_depths, pause_hi, device, m
     return losses, sig
 
 
-def required_fixed_depths(fixed_depths, d_lo, d_hi, fractions):
+def required_fixed_depths(fixed_depths, d_lo, d_hi, fractions, deep_cost=None):
     """
     The fixed depths to evaluate so that every matched-compute depth (under
     both cost models) is bracketed by the curve. Adds the integer floor /
     ceiling of the extreme mean depths when the requested list does not
-    already cover them.
+    already cover them. ``deep_cost`` is the cost of an escalated token in
+    depth units (d_hi plus any pause work); defaults to d_hi.
     """
+    deep_cost = d_hi if deep_cost is None else deep_cost
     depths = {int(d) for d in fixed_depths} | {int(d_lo), int(d_hi)}
-    lo = min((1 - f) * d_lo + f * d_hi for f in fractions)
-    hi = max(d_lo + f * d_hi for f in fractions)
+    lo = min((1 - f) * d_lo + f * deep_cost for f in fractions)
+    hi = max(d_lo + f * deep_cost for f in fractions)
     if min(depths) > lo:
         depths.add(max(1, math.floor(lo)))
     if max(depths) < hi:
@@ -127,7 +129,9 @@ def main():
     ap.add_argument("--depth_lo", type=int, default=None, help="default config.steps_base")
     ap.add_argument("--depth_hi", type=int, default=None, help="default config.steps_reasoning")
     ap.add_argument("--fixed_depths", type=int, nargs="+", default=[1, 2, 4, 8])
-    ap.add_argument("--pause_hi", type=int, default=0, help="Also evaluate depth_hi + this many pause steps")
+    ap.add_argument("--pause_hi", type=int, default=0,
+                    help="Escalated tokens also get this many latent pause cycles (as AdaptiveGenerator "
+                         "does with --pause_steps); charged as pause_hi/num_blocks depth units each")
     ap.add_argument("--fractions", type=float, nargs="+", default=[0.1, 0.25, 0.5])
     ap.add_argument("--seq_length", type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=8)
@@ -146,7 +150,12 @@ def main():
     ds = MemmapDataset(Path(args.data_dir) / "val.bin", seq_len)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
-    fixed_depths = required_fixed_depths(args.fixed_depths, d_lo, d_hi, args.fractions)
+    # An escalated token costs d_hi recursion steps plus pause_hi pause cycles.
+    # One pause cycle is one attention + FFN layer, i.e. 1/num_blocks of a
+    # recursion step across the whole stack, so it is charged that way.
+    num_blocks = model.config.num_blocks
+    deep_cost = d_hi + args.pause_hi / num_blocks
+    fixed_depths = required_fixed_depths(args.fixed_depths, d_lo, d_hi, args.fractions, deep_cost)
     extra = sorted(set(fixed_depths) - set(args.fixed_depths) - {d_lo, d_hi})
     if extra:
         print(f"note: also evaluating fixed depth(s) {extra} so every matched-compute "
@@ -160,12 +169,16 @@ def main():
     print("fixed depth curve")
     for d in sorted(fixed_curve):
         print(f"  depth {d:>2}: loss {fixed_curve[d]:.4f}  ppl {math.exp(fixed_curve[d]):.2f}")
+    # What an escalated token gets: depth d_hi, plus pause_hi pause cycles if asked.
+    deep_loss = losses[("hi_pause", args.pause_hi)] if args.pause_hi else losses[d_hi]
+    deep_label = f"depth {d_hi}" + (f" + {args.pause_hi} pause" if args.pause_hi else "")
     if args.pause_hi:
-        lp = float(losses[("hi_pause", args.pause_hi)].mean())
-        print(f"  depth {d_hi:>2} + {args.pause_hi} pause: loss {lp:.4f}  ppl {math.exp(lp):.2f}")
+        lp = float(deep_loss.mean())
+        print(f"  {deep_label}: loss {lp:.4f}  ppl {math.exp(lp):.2f}  "
+              f"(escalated tokens use this; cost {deep_cost:.2f} depth units)")
 
-    gain = losses[d_lo] - losses[d_hi]  # positive = deep helps this token
-    print(f"\nper-token gain from depth {d_lo} -> {d_hi}: mean {gain.mean():+.4f}, "
+    gain = losses[d_lo] - deep_loss  # positive = escalation helps this token
+    print(f"\nper-token gain from depth {d_lo} -> {deep_label}: mean {gain.mean():+.4f}, "
           f"helps {100 * (gain > 0).mean():.1f}% of tokens")
     for name in ("entropy", "probe", "step_kl"):
         r = np.corrcoef(sig[name], gain)[0, 1]
@@ -175,28 +188,30 @@ def main():
     policies["random"] = rng.random(n_tokens)
     policies["oracle"] = gain
 
-    # Two cost models for the adaptive policy, both reported:
-    #   resume : an escalated token continues the shallow pass, costing d_hi.
-    #            mean depth = (1-f)*d_lo + f*d_hi. Exact for single-block
-    #            models; a lower bound otherwise.
-    #   restart: the shallow pass is discarded and the token is rerun at
-    #            d_hi, which is what AdaptiveGenerator does today.
-    #            mean depth = d_lo + f*d_hi.
-    results = {"fixed_curve": fixed_curve, "d_lo": d_lo, "d_hi": d_hi, "n_tokens": n_tokens, "rows": []}
+    # Two cost models for the adaptive policy, both reported (deep_cost is
+    # d_hi plus the pause work):
+    #   resume : an escalated token continues the shallow pass.
+    #            mean depth = (1-f)*d_lo + f*deep_cost. Exact for
+    #            single-block models; a lower bound otherwise.
+    #   restart: the shallow pass is discarded and the token is rerun,
+    #            which is what AdaptiveGenerator does today.
+    #            mean depth = d_lo + f*deep_cost.
+    results = {"fixed_curve": fixed_curve, "d_lo": d_lo, "d_hi": d_hi, "pause_hi": args.pause_hi,
+               "deep_cost": deep_cost, "n_tokens": n_tokens, "rows": []}
     print(f"\n{'policy':<10}{'frac':>6}{'adaptive':>10}"
           f"{'d_resume':>9}{'fixed':>8}{'delta':>8}"
           f"{'d_restart':>10}{'fixed':>8}{'delta':>8}")
     for f in args.fractions:
         k = int(round(f * n_tokens))
-        depth_resume = (1 - f) * d_lo + f * d_hi
-        depth_restart = d_lo + f * d_hi
+        depth_resume = (1 - f) * d_lo + f * deep_cost
+        depth_restart = d_lo + f * deep_cost
         fixed_resume = interp_fixed(fixed_curve, depth_resume)
         fixed_restart = interp_fixed(fixed_curve, depth_restart)
         for name, values in policies.items():
             idx = np.argpartition(-values, k - 1)[:k] if k > 0 else np.array([], dtype=int)
             mask = np.zeros(n_tokens, dtype=bool)
             mask[idx] = True
-            adaptive = float(np.where(mask, losses[d_hi], losses[d_lo]).mean())
+            adaptive = float(np.where(mask, deep_loss, losses[d_lo]).mean())
             row = {
                 "policy": name, "fraction": f, "adaptive_loss": adaptive,
                 "mean_depth_resume": depth_resume, "fixed_loss_resume": fixed_resume,

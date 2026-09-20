@@ -24,6 +24,13 @@ class TestExperimentHelpers:
         assert max(depths) >= 4 + 0.75 * 8
         assert 1 in depths and 8 in depths
 
+    def test_required_depths_use_deep_cost(self):
+        exp = _load("experiment_adaptive_depth")
+        # d_hi=8 but escalated tokens cost 9 (pause work) -> restart at f=0.5 is 2+4.5=6.5, fine;
+        # at f=1.0-ish fractions the ceiling of d_lo + f*deep_cost must be added.
+        depths = exp.required_fixed_depths([1, 2, 4, 8], 2, 8, [0.9], deep_cost=9.0)
+        assert max(depths) >= 2 + 0.9 * 9.0
+
     def test_required_depths_unchanged_when_covered(self):
         exp = _load("experiment_adaptive_depth")
         assert exp.required_fixed_depths([1, 2, 4, 8], 2, 8, [0.1, 0.5]) == [1, 2, 4, 8]

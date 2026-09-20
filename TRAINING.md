@@ -137,6 +137,11 @@ Read the table like this:
   does today: the shallow pass is discarded and the token reruns at
   `d_hi` (mean depth `d_lo + f·d_hi`). A policy has to beat the restart
   column to pay for itself as implemented.
+- `--pause_hi k` gives escalated tokens `k` latent pause cycles on top of
+  `d_hi`, exactly what `--pause_steps k` does at generation time. Their
+  loss uses the paused deep pass and their cost is charged as
+  `k / num_blocks` extra depth units (one pause cycle is one
+  attention + FFN layer).
 - `delta < 0` means the adaptive policy beats uniform depth at that
   average compute.
 - `random` is the control. A signal that does not beat random is not a

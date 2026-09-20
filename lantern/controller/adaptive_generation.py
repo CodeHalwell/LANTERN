@@ -111,6 +111,11 @@ class AdaptiveGenerator:
         device = input_ids.device
         steps_base = cfg.steps_base or model.config.steps_base
         steps_deep = cfg.steps_deep or model.config.steps_reasoning
+        if cfg.signal == "step_kl" and steps_base < 2:
+            raise ValueError(
+                "signal='step_kl' compares the last two recursion steps, so steps_base "
+                f"must be at least 2 (got {steps_base})"
+            )
 
         budget = min(cfg.max_new_tokens, model.config.max_position - prompt_len)
         result = AdaptiveGenerationResult(tokens=input_ids, trace=[[] for _ in range(batch_size)])
@@ -232,4 +237,10 @@ def calibrate_threshold(signal_values: torch.Tensor, escalate_fraction: float) -
     """Threshold above which ``escalate_fraction`` of the observed values fall."""
     if not 0.0 < escalate_fraction < 1.0:
         raise ValueError("escalate_fraction must be in (0, 1)")
+    values = signal_values.float()
+    if values.numel() == 0 or bool((values == values[0]).all()):
+        raise ValueError(
+            "the signal is constant over the calibration data, so no threshold can "
+            "escalate a fraction of tokens (step_kl at depth 1 is zero everywhere)"
+        )
     return float(torch.quantile(signal_values.float(), 1.0 - escalate_fraction))

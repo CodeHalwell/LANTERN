@@ -154,6 +154,17 @@ class TestCalibration:
         frac = (sig["entropy"] > thr).float().mean().item()
         assert 0.15 <= frac <= 0.35
 
+    def test_constant_signal_rejected(self):
+        with pytest.raises(ValueError):
+            calibrate_threshold(torch.zeros(10), 0.2)
+
+    def test_step_kl_needs_two_steps(self):
+        m, _ = _model()
+        x = torch.randint(0, 80, (1, 4))
+        gen = AdaptiveGenerator(m, AdaptiveGenerationConfig(signal="step_kl", steps_base=1, threshold=0.0))
+        with pytest.raises(ValueError):
+            gen.generate(x)
+
     def test_bad_fraction(self):
         with pytest.raises(ValueError):
             calibrate_threshold(torch.arange(10.0), 1.0)

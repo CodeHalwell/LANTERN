@@ -72,6 +72,11 @@ def main():
         print(tokenizer.decode(out[0].tolist()))
         return
 
+    base_depth = args.depth if args.depth is not None else model.config.steps_base
+    if args.signal == "step_kl" and base_depth < 2:
+        raise SystemExit("--signal step_kl needs a base depth of at least 2 (it compares the "
+                         "last two recursion steps); pass --depth 2 or higher")
+
     threshold = args.threshold
     if threshold is None:
         if not args.data_dir:

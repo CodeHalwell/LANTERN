@@ -129,6 +129,29 @@ class KVCache:
         self.k_cache[depth + 1:, :, :, start_pos:end_pos, :] = src_k.unsqueeze(0)
         self.v_cache[depth + 1:, :, :, start_pos:end_pos, :] = src_v.unsqueeze(0)
 
+    def select_rows(self, rows: torch.Tensor) -> "KVCache":
+        """
+        A new cache holding copies of the given batch rows (index tensor).
+        Used to run a deeper pass on a subset of a batch without touching
+        the other rows' cache entries.
+        """
+        sub = KVCache.__new__(KVCache)
+        sub.max_steps = self.max_steps
+        sub.batch_size = int(rows.numel())
+        sub.num_heads = self.num_heads
+        sub.max_seq_len = self.max_seq_len
+        sub.head_dim = self.head_dim
+        sub.seq_len = self.seq_len
+        sub.k_cache = self.k_cache[:, rows].clone()
+        sub.v_cache = self.v_cache[:, rows].clone()
+        return sub
+
+    def write_rows_from(self, other: "KVCache", rows: torch.Tensor, start_pos: int, end_pos: int):
+        """Copy positions start_pos..end_pos-1 of ``other`` (all steps) into ``rows`` of this cache."""
+        self.k_cache[:, rows, :, start_pos:end_pos] = other.k_cache[:, :, :, start_pos:end_pos]
+        self.v_cache[:, rows, :, start_pos:end_pos] = other.v_cache[:, :, :, start_pos:end_pos]
+        self.seq_len = max(self.seq_len, end_pos)
+
     def truncate(self, seq_len: int):
         """Drop cached positions beyond ``seq_len`` (used to rewind a rejected token)."""
         self.seq_len = min(self.seq_len, seq_len)

@@ -6,13 +6,20 @@ spending the same compute uniformly?
 Teacher-forced on held-out text. For every token we record the loss at the
 shallow depth and at the deep depth, plus the three signals read at the
 shallow depth. A policy escalates the top ``f`` fraction of tokens by its
-signal and takes the deep-depth loss for those tokens. Its mean depth is
-``(1 - f) * d_lo + f * d_hi``. The fixed-depth baseline at the same mean
-depth is interpolated (in log-depth) from the fixed-depth curve.
+signal and takes the deep-depth loss for those tokens. Its compute is
+reported under two cost models, each compared with the fixed-depth curve
+interpolated (in log-depth) at the matching mean depth:
 
-Reported per policy and fraction:
+    resume  : escalated tokens continue the shallow pass, so the mean depth
+              is (1 - f) * d_lo + f * d_hi. Exact for single-block models,
+              a lower bound for stacks.
+    restart : the shallow pass is thrown away and the token is rerun at
+              d_hi, which is what AdaptiveGenerator does today, so the mean
+              depth is d_lo + f * d_hi.
 
-    adaptive loss vs matched fixed-depth loss (negative delta = adaptive wins)
+Negative delta = adaptive wins at that cost. A policy has to beat the
+restart column to pay for itself as implemented; the resume column is
+what a resumable implementation would get.
 
 Policies: entropy, probe, step_kl, random (control, same fraction), and an
 oracle that escalates the tokens with the largest actual gain (upper bound).
@@ -141,21 +148,39 @@ def main():
     policies["random"] = rng.random(n_tokens)
     policies["oracle"] = gain
 
+    # Two cost models for the adaptive policy, both reported:
+    #   resume : an escalated token continues the shallow pass, costing d_hi.
+    #            mean depth = (1-f)*d_lo + f*d_hi. Exact for single-block
+    #            models; a lower bound otherwise.
+    #   restart: the shallow pass is discarded and the token is rerun at
+    #            d_hi, which is what AdaptiveGenerator does today.
+    #            mean depth = d_lo + f*d_hi.
     results = {"fixed_curve": fixed_curve, "d_lo": d_lo, "d_hi": d_hi, "n_tokens": n_tokens, "rows": []}
-    print(f"\n{'policy':<10}{'frac':>6}{'mean_d':>8}{'adaptive':>10}{'fixed@d':>10}{'delta':>9}")
+    print(f"\n{'policy':<10}{'frac':>6}{'adaptive':>10}"
+          f"{'d_resume':>9}{'fixed':>8}{'delta':>8}"
+          f"{'d_restart':>10}{'fixed':>8}{'delta':>8}")
     for f in args.fractions:
         k = int(round(f * n_tokens))
-        mean_depth = (1 - f) * d_lo + f * d_hi
-        fixed_at = interp_fixed(fixed_curve, mean_depth)
+        depth_resume = (1 - f) * d_lo + f * d_hi
+        depth_restart = d_lo + f * d_hi
+        fixed_resume = interp_fixed(fixed_curve, depth_resume)
+        fixed_restart = interp_fixed(fixed_curve, depth_restart)
         for name, values in policies.items():
             idx = np.argpartition(-values, k - 1)[:k] if k > 0 else np.array([], dtype=int)
             mask = np.zeros(n_tokens, dtype=bool)
             mask[idx] = True
             adaptive = float(np.where(mask, losses[d_hi], losses[d_lo]).mean())
-            delta = adaptive - fixed_at
-            results["rows"].append({"policy": name, "fraction": f, "mean_depth": mean_depth,
-                                    "adaptive_loss": adaptive, "fixed_loss": fixed_at, "delta": delta})
-            print(f"{name:<10}{f:>6.2f}{mean_depth:>8.2f}{adaptive:>10.4f}{fixed_at:>10.4f}{delta:>+9.4f}")
+            row = {
+                "policy": name, "fraction": f, "adaptive_loss": adaptive,
+                "mean_depth_resume": depth_resume, "fixed_loss_resume": fixed_resume,
+                "delta_resume": adaptive - fixed_resume,
+                "mean_depth_restart": depth_restart, "fixed_loss_restart": fixed_restart,
+                "delta_restart": adaptive - fixed_restart,
+            }
+            results["rows"].append(row)
+            print(f"{name:<10}{f:>6.2f}{adaptive:>10.4f}"
+                  f"{depth_resume:>9.2f}{fixed_resume:>8.4f}{row['delta_resume']:>+8.4f}"
+                  f"{depth_restart:>10.2f}{fixed_restart:>8.4f}{row['delta_restart']:>+8.4f}")
         print()
 
     if args.out:

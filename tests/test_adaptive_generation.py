@@ -85,6 +85,31 @@ class TestAdaptiveGenerator:
         if all(t.escalated for t in both.trace[0]):
             assert torch.equal(both.tokens[0], row0.tokens[0])
 
+    def test_deep_pass_runs_only_on_escalated_rows(self, monkeypatch):
+        """The deep forward must see only the escalated rows of the batch."""
+        m, cfg = _model()
+        torch.manual_seed(2)
+        x = torch.randint(0, cfg.vocab_size, (3, 5))
+        seen = []
+        orig_forward = m.forward
+
+        def spy(input_ids, *a, **kw):
+            if kw.get("steps_per_block") == cfg.steps_reasoning:
+                seen.append(input_ids.shape[0])
+            return orig_forward(input_ids, *a, **kw)
+
+        monkeypatch.setattr(m, "forward", spy)
+        # Escalate only the highest-entropy row on the first step.
+        probe = AdaptiveGenerator(m, AdaptiveGenerationConfig(max_new_tokens=1, temperature=0)).generate(x)
+        ents = sorted((row[0].entropy for row in probe.trace), reverse=True)
+        thr = (ents[0] + ents[1]) / 2
+        seen.clear()
+        r = AdaptiveGenerator(m, AdaptiveGenerationConfig(
+            max_new_tokens=1, temperature=0, signal="entropy", threshold=thr,
+        )).generate(x)
+        assert sum(t[0].escalated for t in r.trace) == 1
+        assert seen == [1]
+
     def test_eos_handling(self):
         m, cfg = _model()
         m.lm_head = torch.nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=True)

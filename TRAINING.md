@@ -126,13 +126,18 @@ Teacher-forced on validation text. For every token it records the loss at
 the shallow and deep depth plus three signals read at the shallow depth:
 entropy, the epistemic probe, and step-KL (how much the distribution moved
 between the last two recursion steps). A policy escalates the top `f`
-fraction of tokens by its signal; its mean depth is `(1-f)·d_lo + f·d_hi`,
-and it is compared with the fixed-depth curve interpolated at that mean
-depth.
+fraction of tokens by its signal and is compared with the fixed-depth
+curve interpolated at the same mean depth, under two cost models.
 
 Read the table like this:
 
-- `delta < 0` means the adaptive policy beats uniform depth at the same
+- Two cost columns. `d_resume` assumes an escalated token continues the
+  shallow pass (mean depth `(1-f)·d_lo + f·d_hi`; exact for single-block
+  models, a lower bound for stacks). `d_restart` is what the generator
+  does today: the shallow pass is discarded and the token reruns at
+  `d_hi` (mean depth `d_lo + f·d_hi`). A policy has to beat the restart
+  column to pay for itself as implemented.
+- `delta < 0` means the adaptive policy beats uniform depth at that
   average compute.
 - `random` is the control. A signal that does not beat random is not a
   signal.

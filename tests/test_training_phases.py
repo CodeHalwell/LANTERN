@@ -15,6 +15,7 @@ from lantern.training import (
     Phase1Trainer,
     Phase2Trainer,
     Phase3Trainer,
+    binary_to_additive_mask,
     compute_ponder_cost_masked,
     selective_dropout_train,
 )
@@ -314,3 +315,28 @@ class TestGradientAccumulation:
         trainer = Phase1Trainer(model, loader, max_steps=2, use_bfloat16=False)
         with pytest.raises(ValueError):
             trainer.train_step([])
+
+
+class TestPaddingMask:
+    def test_binary_to_additive_shape_and_values(self):
+        mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+        add = binary_to_additive_mask(mask)
+        assert add.shape == (2, 1, 1, 3)
+        assert add[0, 0, 0, 0] == 0 and add[0, 0, 0, 2] == float("-inf")
+        assert add[1, 0, 0, 1] == float("-inf")
+
+    def test_phase3_masks_padding_keys(self):
+        """Real-token logits must not depend on the content of padded positions."""
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.dropout = 0.0
+        model = LANTERNModel(config).eval()
+        x = torch.randint(0, TEST_VOCAB_SIZE, (1, 8))
+        y = x.clone()
+        y[0, 6:] = (y[0, 6:] + 1) % TEST_VOCAB_SIZE  # change the padded tail
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        add = binary_to_additive_mask(mask)
+        with torch.no_grad():
+            a, _, _ = model(x, attention_mask=add)
+            b, _, _ = model(y, attention_mask=add)
+        assert torch.allclose(a[0, :6], b[0, :6], atol=1e-5)

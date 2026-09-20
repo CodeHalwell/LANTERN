@@ -12,8 +12,10 @@ The generation loop the design describes, wired to the real model:
                           steps of the final block       (free)
               none      : never escalate
         3. if signal > threshold: escalate
-              rewind the cache to before this token and run again at
-              steps_deep, optionally with latent pause steps
+              rerun this token (only the escalated batch rows) at
+              steps_deep from the cached prefix, optionally with latent
+              pause steps. The shallow pass is not reused, so an escalated
+              token costs steps_base + steps_deep recursion steps.
         4. sample from whichever logits were produced last
 
 Thresholds are absolute. Use ``calibrate_threshold`` on held-out text to
@@ -139,33 +141,24 @@ class AdaptiveGenerator:
             pause_used = torch.zeros(batch_size, dtype=torch.long, device=device)
 
             if bool(escalate.any()):
-                # Rewind the cache for these positions and recompute deeper.
-                # The whole batch is recomputed together, so snapshot the
-                # shallow cache entries and restore them for rows that did
-                # not escalate; those rows keep their shallow logits too.
+                # Rerun only the escalated rows, deeper, on copies of their
+                # cache entries. Other rows spend nothing and keep their
+                # shallow logits and cache entries untouched.
+                rows = escalate.nonzero(as_tuple=False).squeeze(-1)
                 end = start_pos + cur_input.shape[1]
-                keep = ~escalate
-                snapshot = [
-                    (c.k_cache[:, keep, :, start_pos:end].clone(),
-                     c.v_cache[:, keep, :, start_pos:end].clone())
-                    for c in caches
-                ]
-                for c in caches:
+                sub_caches = [c.select_rows(rows) for c in caches]
+                for c in sub_caches:
                     c.truncate(start_pos)
                 deep_logits, _, _ = model(
-                    cur_input, steps_per_block=steps_deep, pause_steps=cfg.pause_steps,
-                    kv_caches=caches, start_pos=start_pos,
+                    cur_input[rows], steps_per_block=steps_deep, pause_steps=cfg.pause_steps,
+                    kv_caches=sub_caches, start_pos=start_pos,
                 )
-                for c, (k_snap, v_snap) in zip(caches, snapshot):
-                    c.k_cache[:, keep, :, start_pos:end] = k_snap
-                    c.v_cache[:, keep, :, start_pos:end] = v_snap
-                logits_last = torch.where(
-                    escalate.unsqueeze(-1), deep_logits[:, -1, :], logits_last
-                )
-                depth_used = torch.where(escalate, torch.full_like(depth_used, steps_deep), depth_used)
-                pause_used = torch.where(
-                    escalate, torch.full_like(pause_used, self.effective_pause_steps), pause_used
-                )
+                for c, sub in zip(caches, sub_caches):
+                    c.write_rows_from(sub, rows, start_pos, end)
+                logits_last = logits_last.clone()
+                logits_last[rows] = deep_logits[:, -1, :]
+                depth_used[rows] = steps_deep
+                pause_used[rows] = self.effective_pause_steps
 
             next_token = sample_from_logits(
                 logits_last, temperature=cfg.temperature, top_k=cfg.top_k, top_p=cfg.top_p

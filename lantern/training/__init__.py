@@ -104,6 +104,18 @@ def _micro_batches(batch: Union[Batch, Sequence[Batch]]) -> List[Batch]:
     return batches
 
 
+def binary_to_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Turn a binary padding mask [batch, seq_len] (1 = real token) into the
+    additive key mask the attention layers expect: 0 for real keys, -inf for
+    padding keys, shaped [batch, 1, 1, seq_len] so it broadcasts over heads
+    and query positions.
+    """
+    additive = torch.zeros(attention_mask.shape, dtype=dtype, device=attention_mask.device)
+    additive = additive.masked_fill(attention_mask == 0, float("-inf"))
+    return additive[:, None, None, :]
+
+
 def compute_ponder_cost_masked(
     ponder_cost: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -412,13 +424,16 @@ class Phase3Trainer:
             input_ids = micro["input_ids"].to(self.device)
             labels = micro["labels"].to(self.device)
             attention_mask = micro.get("attention_mask")
+            additive_mask = None
             if attention_mask is not None:
+                # Binary mask for the ponder accounting; additive for attention.
                 attention_mask = attention_mask.to(self.device)
+                additive_mask = binary_to_additive_mask(attention_mask)
 
             with _autocast(self.device, self.use_bfloat16):
                 logits, _, ponder_cost = self.model(
                     input_ids,
-                    attention_mask=attention_mask,
+                    attention_mask=additive_mask,
                     use_adaptive_halting=True,
                     pause_steps=pause_steps,
                 )

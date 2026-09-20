@@ -2,20 +2,23 @@
 Tests for LANTERN three-phase training curriculum.
 """
 
+import copy
+import random
+
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from lantern.models.lantern_model import LANTERNModel
-from lantern.utils.config import create_small_config
 from lantern.training import (
     Phase1Trainer,
     Phase2Trainer,
     Phase3Trainer,
-    selective_dropout_train,
     compute_ponder_cost_masked,
+    selective_dropout_train,
 )
-
+from lantern.utils.config import create_small_config
 
 TEST_VOCAB_SIZE = 100
 
@@ -239,3 +242,63 @@ class TestPhase3Trainer:
         assert "ce_loss" in metrics
         assert "ponder_cost" in metrics
         assert "ponder_lambda" in metrics
+
+
+class TestGradientAccumulation:
+    """A list of batches must all contribute to one optimizer step."""
+
+    def test_phase1_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase1Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        it = iter(loader)
+        batches = [next(it), next(it)]
+        random.seed(0)
+        loss = trainer.train_step(batches)
+        assert isinstance(loss, float) and loss > 0
+
+    def test_accumulated_step_uses_every_batch(self):
+        """Two distinct batches -> the update differs from a step on either one alone."""
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.dropout = 0.0
+        base = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        it = iter(loader)
+        b1, b2 = next(it), next(it)
+
+        def step_with(batch):
+            model = copy.deepcopy(base)
+            trainer = Phase1Trainer(model, loader, max_steps=10, warmup_steps=0,
+                                    learning_rate=1e-2, use_bfloat16=False,
+                                    min_depth=1, max_depth=1)
+            trainer.train_step(batch)
+            return torch.cat([p.detach().flatten() for p in model.parameters()])
+
+        both = step_with([b1, b2])
+        only1 = step_with(b1)
+        only2 = step_with(b2)
+        assert not torch.allclose(both, only1)
+        assert not torch.allclose(both, only2)
+
+    def test_phase3_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        config.use_adaptive_halting = True
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase3Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        it = iter(loader)
+        out = trainer.train_step([next(it), next(it)])
+        assert out["total_loss"] > 0
+
+    def test_empty_list_rejected(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase1Trainer(model, loader, max_steps=2, use_bfloat16=False)
+        with pytest.raises(ValueError):
+            trainer.train_step([])

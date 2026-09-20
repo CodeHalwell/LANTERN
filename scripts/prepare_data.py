@@ -129,9 +129,6 @@ def main():
         all_docs = lambda: iter_hf_docs(args.dataset, "train", None)  # noqa: E731
         has_val_split = args.dataset == "tinystories"
 
-    if args.vocab_size > np.iinfo(TOKEN_DTYPE).max + 1:
-        ap.error(f"--vocab_size must be <= {np.iinfo(TOKEN_DTYPE).max + 1} for uint16 storage")
-
     # ---- tokenizer
     tok_path = out_dir / "tokenizer.json"
     if args.tokenizer:
@@ -143,6 +140,13 @@ def main():
         tokenizer = BPETokenizer.train(take(all_docs(), args.tokenizer_docs), vocab_size=args.vocab_size)
         tokenizer.save(tok_path)
         print(f"Saved tokenizer to {tok_path} (vocab {tokenizer.vocab_size})")
+
+    max_vocab = np.iinfo(TOKEN_DTYPE).max + 1
+    if tokenizer.vocab_size > max_vocab:
+        ap.error(
+            f"tokenizer has {tokenizer.vocab_size} tokens but {TOKEN_DTYPE.__name__} storage "
+            f"holds at most {max_vocab}; use a smaller vocabulary"
+        )
 
     # ---- validation
     print("Writing val.bin ...")

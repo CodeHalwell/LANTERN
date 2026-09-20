@@ -28,6 +28,7 @@ Examples::
 import argparse
 import json
 import math
+import random
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -129,6 +130,11 @@ def build_datasets(args, output_dir: Path):
 def make_loader(ds: Optional[Dataset], batch_size: int, shuffle: bool, num_workers: int, device: str):
     if ds is None:
         return None
+    if len(ds) < batch_size:
+        raise SystemExit(
+            f"Dataset has {len(ds)} windows but --batch_size is {batch_size}. "
+            f"Use more data, a shorter --seq_length or a smaller batch."
+        )
     return DataLoader(
         ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
         pin_memory=device.startswith("cuda"), drop_last=True,
@@ -152,14 +158,15 @@ class Logger:
 
 
 def run_phase(phase: int, trainer, train_loader, steps: int, args, output_dir: Path,
-              tokenizer_path: str, log: Logger, val_loader=None):
+              tokenizer_path: str, log: Logger, val_loader=None, grad_accum: int = 1):
+    """Run ``steps`` optimizer steps; each consumes ``grad_accum`` loader batches."""
     model = trainer.model
     model.train()
     batches = infinite(train_loader)
     t0 = time.time()
     best_val = math.inf
     for step in range(1, steps + 1):
-        batch = next(batches)
+        batch = [next(batches) for _ in range(grad_accum)] if grad_accum > 1 else next(batches)
         out = trainer.train_step(batch)
         metrics = out if isinstance(out, dict) else {"loss": out}
 
@@ -174,7 +181,7 @@ def run_phase(phase: int, trainer, train_loader, steps: int, args, output_dir: P
                            use_halting=(phase == 3))
             print(f"[phase {phase}] step {step} val_loss={val:.4f} ppl={math.exp(val):.2f}", flush=True)
             log(phase=phase, step=step, val_loss=val)
-            if val < best_val:
+            if not math.isnan(val) and val < best_val:
                 best_val = val
                 save_checkpoint(model, output_dir / f"phase{phase}_best.pt", phase, step, tokenizer_path)
 
@@ -202,7 +209,7 @@ def evaluate(model, loader, device, max_batches, use_halting=False, depth=None):
         ).item()
         n += 1
     model.train(was_training)
-    return total / max(1, n)
+    return total / n if n else float("nan")
 
 
 # ----------------------------------------------------------------- main
@@ -232,7 +239,8 @@ def main():
     ap.add_argument("--phase3_steps", type=int, default=5000)
     ap.add_argument("--max_steps", type=int, default=None, help="Alias for --phase1_steps")
     ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--grad_accum", type=int, default=1)
+    ap.add_argument("--grad_accum", type=int, default=1,
+                    help="Loader batches per optimizer step (effective batch = batch_size * grad_accum)")
     ap.add_argument("--learning_rate", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--warmup_steps", type=int, default=100)
@@ -254,6 +262,7 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    random.seed(args.seed)  # Phase 1 depth and Phase 3 pause sampling use `random`
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.max_steps is not None:
@@ -301,10 +310,10 @@ def main():
                 model, train_loader, val_loader,
                 learning_rate=args.learning_rate, weight_decay=args.weight_decay,
                 warmup_steps=args.warmup_steps, max_steps=args.phase1_steps,
-                grad_clip=args.grad_clip, device=args.device,
-                use_bfloat16=use_bf16, grad_accum_steps=args.grad_accum,
+                grad_clip=args.grad_clip, device=args.device, use_bfloat16=use_bf16,
             )
-            run_phase(1, trainer, train_loader, args.phase1_steps, args, output_dir, tokenizer_path, log, val_loader)
+            run_phase(1, trainer, train_loader, args.phase1_steps, args, output_dir, tokenizer_path, log,
+                      val_loader, grad_accum=args.grad_accum)
         elif phase == 2:
             trainer = Phase2Trainer(
                 model, train_loader, num_mc_samples=args.mc_samples,
@@ -324,9 +333,9 @@ def main():
                 max_steps=args.phase3_steps, grad_clip=args.grad_clip,
                 use_bfloat16=use_bf16, device=args.device,
                 warmup_steps=min(args.warmup_steps, args.phase3_steps // 10),
-                grad_accum_steps=args.grad_accum,
             )
-            run_phase(3, trainer, train_loader, args.phase3_steps, args, output_dir, tokenizer_path, log, val_loader)
+            run_phase(3, trainer, train_loader, args.phase3_steps, args, output_dir, tokenizer_path, log,
+                      val_loader, grad_accum=args.grad_accum)
 
     save_checkpoint(model, output_dir / "final_model.pt", phases[-1], 0, tokenizer_path)
     print("Done.")

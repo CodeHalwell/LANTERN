@@ -22,7 +22,7 @@ Phase 3: Controller Unlock
 import math
 import random
 from contextlib import contextmanager, nullcontext
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -87,16 +87,21 @@ def _autocast(device: str, enabled: bool):
     return nullcontext()
 
 
-def _split_batch(batch: Dict[str, torch.Tensor], n: int):
-    """Split every tensor in the batch into ``n`` micro-batches along dim 0."""
-    if n <= 1:
+Batch = Dict[str, torch.Tensor]
+
+
+def _micro_batches(batch: Union[Batch, Sequence[Batch]]) -> List[Batch]:
+    """
+    A trainer's ``train_step`` takes either one loader batch or a list of
+    them. A list means gradient accumulation: every batch contributes to the
+    same optimizer step, so the effective batch is ``len(list) * batch_size``.
+    """
+    if isinstance(batch, dict):
         return [batch]
-    size = next(iter(batch.values())).shape[0]
-    n = min(n, size)
-    return [
-        {k: v[i::n] if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        for i in range(n)
-    ]
+    batches = list(batch)
+    if not batches:
+        raise ValueError("train_step needs at least one batch")
+    return batches
 
 
 def compute_ponder_cost_masked(
@@ -146,7 +151,6 @@ class Phase1Trainer:
         min_depth: int = 1,
         max_depth: Optional[int] = None,
         use_bfloat16: bool = True,
-        grad_accum_steps: int = 1,
         min_lr_ratio: float = 0.1,
     ):
         self.model = model.to(device)
@@ -159,7 +163,6 @@ class Phase1Trainer:
         self.min_depth = min_depth
         self.max_depth = max_depth if max_depth is not None else model.config.max_steps
         self.use_bfloat16 = use_bfloat16
-        self.grad_accum_steps = max(1, grad_accum_steps)
 
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=learning_rate, weight_decay=weight_decay,
@@ -169,11 +172,16 @@ class Phase1Trainer:
             self.optimizer, warmup_steps, max_steps, min_lr_ratio
         )
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single Phase 1 optimizer step with a random recursion depth."""
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> float:
+        """
+        Single Phase 1 optimizer step with a random recursion depth.
+
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over (see ``_micro_batches``).
+        """
         # One depth per optimizer step so every step embedding gets trained.
         random_depth = random.randint(self.min_depth, self.max_depth)
-        micro_batches = _split_batch(batch, self.grad_accum_steps)
+        micro_batches = _micro_batches(batch)
 
         self.optimizer.zero_grad()
         total = 0.0
@@ -322,7 +330,6 @@ class Phase3Trainer:
         use_bfloat16: bool = True,
         device: str = "cpu",
         warmup_steps: int = 0,
-        grad_accum_steps: int = 1,
         pause_prob: float = 0.5,
         min_lr_ratio: float = 0.1,
     ):
@@ -335,7 +342,6 @@ class Phase3Trainer:
         self.ponder_lambda = ponder_lambda
         self.ponder_warmup_steps = ponder_warmup_steps
         self.use_bfloat16 = use_bfloat16 and device != "cpu"
-        self.grad_accum_steps = max(1, grad_accum_steps)
         # Fraction of optimizer steps that apply 1..max_pause_steps latent
         # pause cycles to the whole sequence, so the pause module is trained
         # exactly the way cached decoding uses it.
@@ -383,11 +389,16 @@ class Phase3Trainer:
             return random.randint(1, self.model.config.max_pause_steps)
         return 0
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Single Phase 3 optimizer step with ACT and random latent pause."""
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> Dict[str, float]:
+        """
+        Single Phase 3 optimizer step with ACT and random latent pause.
+
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over.
+        """
         pause_steps = self._sample_pause_steps()
         current_lambda = self._get_ponder_lambda()
-        micro_batches = _split_batch(batch, self.grad_accum_steps)
+        micro_batches = _micro_batches(batch)
         n_micro = len(micro_batches)
 
         self.optimizer.zero_grad()

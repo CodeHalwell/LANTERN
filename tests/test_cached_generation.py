@@ -157,6 +157,25 @@ class TestCheckpointIO:
             load_checkpoint(str(path), "cpu")
 
 
+class TestTrainHelpers:
+    def test_make_loader_rejects_undersized_dataset(self):
+        from torch.utils.data import TensorDataset
+
+        from train import make_loader
+
+        ds = TensorDataset(torch.zeros(3, 4))
+        with pytest.raises(SystemExit):
+            make_loader(ds, batch_size=8, shuffle=False, num_workers=0, device="cpu")
+        assert make_loader(ds, batch_size=2, shuffle=False, num_workers=0, device="cpu") is not None
+
+    def test_evaluate_returns_nan_on_empty_loader(self):
+        from train import evaluate
+
+        m, _ = _model()
+        val = evaluate(m, [], "cpu", max_batches=None)
+        assert val != val  # NaN
+
+
 class TestConfigs:
     def test_300m_config_size(self):
         cfg = create_300m_config()

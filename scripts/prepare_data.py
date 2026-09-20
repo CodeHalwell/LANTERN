@@ -178,6 +178,9 @@ def main():
         train_skip = n_val_docs
     n_val = write_tokens(val_docs, tokenizer, out_dir / "val.bin")
     print(f"  val: {n_val:,} tokens")
+    if n_val == 0:
+        (out_dir / "val.bin").unlink()
+        print("  no held-out documents; val.bin not written (train.py will run without validation)")
 
     # ---- train
     print("Writing train.bin ...")

@@ -168,6 +168,21 @@ class TestTrainHelpers:
             make_loader(ds, batch_size=8, shuffle=False, num_workers=0, device="cpu")
         assert make_loader(ds, batch_size=2, shuffle=False, num_workers=0, device="cpu") is not None
 
+    def test_build_datasets_skips_undersized_val(self, tmp_path):
+        import json
+        import types
+
+        import numpy as np
+
+        from train import build_datasets
+
+        np.arange(200, dtype=np.uint16).tofile(tmp_path / "train.bin")
+        np.arange(5, dtype=np.uint16).tofile(tmp_path / "val.bin")
+        (tmp_path / "meta.json").write_text(json.dumps({"vocab_size": 300, "eos_token_id": 2}))
+        args = types.SimpleNamespace(data_dir=str(tmp_path), seq_length=16, data_path=None)
+        train_ds, val_ds, vocab, _, eos = build_datasets(args, tmp_path)
+        assert val_ds is None and len(train_ds) > 0 and vocab == 300 and eos == 2
+
     def test_evaluate_returns_nan_on_empty_loader(self):
         from train import evaluate
 

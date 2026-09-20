@@ -256,6 +256,11 @@ class Phase2Trainer:
         max_steps: int = 2000,
         device: str = "cpu",
     ):
+        if num_mc_samples < 2:
+            raise ValueError(
+                "num_mc_samples must be at least 2: the distillation target is the "
+                "variance across MC-dropout samples"
+            )
         self.model = model.to(device)
         self.train_loader = train_loader
         self.device = device

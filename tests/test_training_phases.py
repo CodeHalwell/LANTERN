@@ -245,6 +245,17 @@ class TestPhase3Trainer:
         assert "ponder_lambda" in metrics
 
 
+class TestPhase2Validation:
+    def test_requires_two_mc_samples(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        with pytest.raises(ValueError):
+            Phase2Trainer(model, loader, num_mc_samples=1)
+        Phase2Trainer(model, loader, num_mc_samples=2)
+
+
 class TestGradientAccumulation:
     """A list of batches must all contribute to one optimizer step."""
 

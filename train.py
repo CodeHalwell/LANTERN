@@ -35,10 +35,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from lantern.data import MemmapDataset, TokenizedTextDataset, load_data_dir_meta
+from lantern.data import (
+    TOKEN_DTYPE,
+    MemmapDataset,
+    TokenizedTextDataset,
+    load_data_dir_meta,
+)
 from lantern.models.lantern_model import LANTERNModel
 from lantern.training import Phase1Trainer, Phase2Trainer, Phase3Trainer
 from lantern.utils.bpe_tokenizer import BPETokenizer
@@ -108,7 +114,15 @@ def build_datasets(args, output_dir: Path):
         d = Path(args.data_dir)
         meta = load_data_dir_meta(d)
         train_ds = MemmapDataset(d / "train.bin", args.seq_length)
-        val_ds = MemmapDataset(d / "val.bin", args.seq_length) if (d / "val.bin").exists() else None
+        val_ds = None
+        val_path = d / "val.bin"
+        if val_path.exists():
+            n_val_tokens = val_path.stat().st_size // np.dtype(TOKEN_DTYPE).itemsize
+            if n_val_tokens >= args.seq_length + 1:
+                val_ds = MemmapDataset(val_path, args.seq_length)
+            else:
+                print(f"note: {val_path} holds {n_val_tokens} tokens, fewer than one "
+                      f"{args.seq_length}-token window; training without validation")
         return train_ds, val_ds, meta["vocab_size"], str(d / "tokenizer.json"), meta["eos_token_id"]
 
     if not args.data_path:
@@ -246,7 +260,7 @@ def main():
     ap.add_argument("--warmup_steps", type=int, default=100)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--no_bf16", action="store_true")
-    ap.add_argument("--mc_samples", type=int, default=5, help="Phase 2 MC-dropout samples")
+    ap.add_argument("--mc_samples", type=int, default=5, help="Phase 2 MC-dropout samples (at least 2)")
     ap.add_argument("--ponder_lambda", type=float, default=0.01)
     ap.add_argument("--backbone_lr", type=float, default=1e-5, help="Phase 3 backbone LR")
     ap.add_argument("--reasoning_lr", type=float, default=1e-3, help="Phase 3 heads LR")
@@ -261,6 +275,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    if args.mc_samples < 2:
+        ap.error("--mc_samples must be at least 2 (the probe target is a variance)")
     torch.manual_seed(args.seed)
     random.seed(args.seed)  # Phase 1 depth and Phase 3 pause sampling use `random`
     output_dir = Path(args.output_dir)

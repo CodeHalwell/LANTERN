@@ -260,41 +260,46 @@ class Phase2Trainer:
             model.epistemic_probe.parameters(), lr=learning_rate,
         )
 
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single Phase 2 distillation step."""
+    def _distillation_loss(self, batch: Batch) -> torch.Tensor:
+        """MSE between the probe and MC-dropout variance for one loader batch."""
         input_ids = batch["input_ids"].to(self.device)
 
-        # Get hidden states from frozen backbone (eval mode)
+        # Hidden states from the frozen backbone (eval mode)
         self.model.eval()
         with torch.no_grad():
-            _, hidden_states, _ = self.model(
-                input_ids, return_hidden_states=True,
-            )
+            _, hidden_states, _ = self.model(input_ids, return_hidden_states=True)
 
-        # MC Dropout sampling with selective dropout
-        mc_logits = []
+        # MC Dropout sampling with only the dropout layers in train mode
+        mc_probs = []
         for _ in range(self.num_mc_samples):
             with selective_dropout_train(self.model):
                 with torch.no_grad():
                     sample_logits, _, _ = self.model(input_ids)
-                    mc_logits.append(F.softmax(sample_logits, dim=-1))
+                    mc_probs.append(F.softmax(sample_logits, dim=-1))
 
-        # Stack: [num_samples, batch, seq_len, vocab_size]
-        all_probs = torch.stack(mc_logits, dim=0)
-        # Variance across samples, summed over vocab -> [batch, seq_len]
-        mc_variance = all_probs.var(dim=0).sum(dim=-1)
+        # [num_samples, batch, seq_len, vocab] -> variance summed over vocab
+        # -> [batch, seq_len]. Bounded in [0, 1), matching the probe's sigmoid.
+        mc_variance = torch.stack(mc_probs, dim=0).var(dim=0).sum(dim=-1)
 
-        # Train probe to predict this variance. The MC variance (sum over the
-        # vocabulary of per-token probability variance) is bounded in [0, 1),
-        # matching the probe's sigmoid output range.
         probe_pred = self.model.epistemic_probe(hidden_states.detach())
-        loss = F.mse_loss(probe_pred, mc_variance.detach())
+        return F.mse_loss(probe_pred, mc_variance.detach())
 
+    def train_step(self, batch: Union[Batch, Sequence[Batch]]) -> float:
+        """
+        Single Phase 2 distillation step.
+
+        ``batch`` is one loader batch, or a list of them to accumulate
+        gradients over.
+        """
+        micro_batches = _micro_batches(batch)
         self.optimizer.zero_grad()
-        loss.backward()
+        total = 0.0
+        for micro in micro_batches:
+            loss = self._distillation_loss(micro)
+            (loss / len(micro_batches)).backward()
+            total += loss.item() / len(micro_batches)
         self.optimizer.step()
-
-        return loss.item()
+        return total
 
     def cleanup(self):
         """Unfreeze backbone after Phase 2."""

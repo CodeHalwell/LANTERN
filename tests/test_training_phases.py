@@ -283,6 +283,18 @@ class TestGradientAccumulation:
         assert not torch.allclose(both, only1)
         assert not torch.allclose(both, only2)
 
+    def test_phase2_accepts_list_of_batches(self):
+        config = create_small_config()
+        config.vocab_size = TEST_VOCAB_SIZE
+        model = LANTERNModel(config)
+        loader = _make_dataloader(vocab_size=config.vocab_size)
+        trainer = Phase2Trainer(model, loader, num_mc_samples=2, max_steps=2)
+        it = iter(loader)
+        before = model.epistemic_probe.net[0].weight.detach().clone()
+        loss = trainer.train_step([next(it), next(it)])
+        assert isinstance(loss, float) and loss >= 0
+        assert not torch.equal(before, model.epistemic_probe.net[0].weight.detach())
+
     def test_phase3_accepts_list_of_batches(self):
         config = create_small_config()
         config.vocab_size = TEST_VOCAB_SIZE

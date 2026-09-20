@@ -319,7 +319,8 @@ def main():
                 model, train_loader, num_mc_samples=args.mc_samples,
                 learning_rate=1e-3, max_steps=args.phase2_steps, device=args.device,
             )
-            run_phase(2, trainer, train_loader, args.phase2_steps, args, output_dir, tokenizer_path, log)
+            run_phase(2, trainer, train_loader, args.phase2_steps, args, output_dir, tokenizer_path, log,
+                      grad_accum=args.grad_accum)
             trainer.cleanup()
         else:
             raw = model._orig_mod if hasattr(model, "_orig_mod") else model

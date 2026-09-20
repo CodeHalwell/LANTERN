@@ -94,8 +94,12 @@ class AdaptiveGenerator:
     def __init__(self, model: LANTERNModel, config: Optional[AdaptiveGenerationConfig] = None):
         if config is not None and config.signal not in SIGNALS:
             raise ValueError(f"signal must be one of {SIGNALS}")
+        if config is not None and config.pause_steps < 0:
+            raise ValueError("pause_steps must be >= 0")
         self.model = model
         self.config = config or AdaptiveGenerationConfig()
+        # The pause module clamps to max_pause_steps; record what actually runs.
+        self.effective_pause_steps = min(self.config.pause_steps, model.config.max_pause_steps)
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor) -> AdaptiveGenerationResult:
@@ -159,7 +163,9 @@ class AdaptiveGenerator:
                     escalate.unsqueeze(-1), deep_logits[:, -1, :], logits_last
                 )
                 depth_used = torch.where(escalate, torch.full_like(depth_used, steps_deep), depth_used)
-                pause_used = torch.where(escalate, torch.full_like(pause_used, cfg.pause_steps), pause_used)
+                pause_used = torch.where(
+                    escalate, torch.full_like(pause_used, self.effective_pause_steps), pause_used
+                )
 
             next_token = sample_from_logits(
                 logits_last, temperature=cfg.temperature, top_k=cfg.top_k, top_p=cfg.top_p

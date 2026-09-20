@@ -98,6 +98,20 @@ class TestAdaptiveGenerator:
         assert r.tokens.shape[1] == 5
         assert len(r.trace[0]) == 1
 
+    def test_trace_records_clamped_pause_steps(self):
+        m, cfg = _model()
+        x = torch.randint(0, cfg.vocab_size, (1, 4))
+        r = AdaptiveGenerator(m, AdaptiveGenerationConfig(
+            max_new_tokens=3, temperature=0, signal="entropy", threshold=-1.0,
+            pause_steps=cfg.max_pause_steps + 5,
+        )).generate(x)
+        assert all(t.pause_steps == cfg.max_pause_steps for t in r.trace[0])
+
+    def test_negative_pause_steps_rejected(self):
+        m, _ = _model()
+        with pytest.raises(ValueError):
+            AdaptiveGenerator(m, AdaptiveGenerationConfig(pause_steps=-1))
+
     def test_bad_signal_rejected(self):
         m, _ = _model()
         with pytest.raises(ValueError):

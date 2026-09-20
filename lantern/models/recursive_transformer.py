@@ -128,8 +128,9 @@ class RecursiveTransformerBlock(nn.Module):
         Returns:
             (output hidden states, halting probabilities or None)
         """
-        if step_index is not None and step_index < self.max_steps:
-            step_emb = self.step_embeddings.weight[step_index]
+        if step_index is not None:
+            # Depths beyond max_steps reuse the final step embedding.
+            step_emb = self.step_embeddings.weight[min(step_index, self.max_steps - 1)]
             hidden_states = hidden_states + step_emb
 
         # Depths beyond max_steps reuse the last step embedding; the cache
